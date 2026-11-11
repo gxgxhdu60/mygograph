@@ -242,3 +242,22 @@ func (gl *GraphLayout) buildRow(c *ui.Context, rowIdx int) ui.Element {
 		}
 	})
 }
+
+// snapshotLiveState 实现 liveStateHolder：逐个快照布局内所有子图的窗口交互状态。
+func (gl *GraphLayout) snapshotLiveState() func() {
+	var restores []func()
+	for _, row := range gl.rows {
+		for _, cell := range row.cells {
+			if h, ok := cell.widget.(liveStateHolder); ok {
+				restores = append(restores, h.snapshotLiveState())
+			}
+		}
+	}
+	ratios := append([]float32(nil), gl.splitRatios...)
+	return func() {
+		for _, r := range restores {
+			r()
+		}
+		gl.splitRatios = append(gl.splitRatios[:0], ratios...)
+	}
+}

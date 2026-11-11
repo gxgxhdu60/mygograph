@@ -141,10 +141,10 @@ func NewImage(opts ...ImageOption) *ImageItem {
 	return it
 }
 
-func (im *ImageItem) ZValue() float32      { return im.zVal }
-func (im *ImageItem) Visible() bool        { return im.visible }
-func (im *ImageItem) SetVisible(v bool)    { im.visible = v }
-func (im *ImageItem) LegendName() string   { return im.name }
+func (im *ImageItem) ZValue() float32       { return im.zVal }
+func (im *ImageItem) Visible() bool         { return im.visible }
+func (im *ImageItem) SetVisible(v bool)     { im.visible = v }
+func (im *ImageItem) LegendName() string    { return im.name }
 func (im *ImageItem) LegendColor() ui.Color { return im.ctrl.Colormap().At(0.75) }
 
 // Control 返回当前绑定的 ColorControl（可直接传入 NewColorBar 或 NewHistogramLUT）。
@@ -375,31 +375,31 @@ func (im *ImageItem) Draw(rc *mygograph.RenderContext) {
 // 每次调用 PushRow 仅原地覆写纹理中的单行字节并推进环形写指针 RowOffset，由 lut16.kage 在片段着色器内执行
 // fract(uv.y + RowOffset) 循环寻址，彻底消除整张大矩阵内存搬移与双矩形拼接缝隙！
 type WaterfallItem struct {
-	mu           sync.Mutex
-	name         string
-	visible      bool
-	zVal         float32
-	smooth       bool
-	newestAtTop  bool // true（默认）：最新推入帧在顶部向下瀑布滚动；false：最新帧在底部向上推进
-	opacity      float32
-	cols, rows   int
-	x0, x1       float64
-	y0, y1       float64
-	baseMin      float64
-	baseMax      float64
-	invBaseSpan  float64
-	writeRow     int
-	filledRows   int
-	raw          []float64
-	rgba         *image.RGBA
-	bmp          *ui.Bitmap
-	dirtyGPU     bool
-	histSubTick  uint32
-	seq          atomic.Uint64
-	wakeArmed    atomic.Bool
-	wakeFn       func()
-	ctrl         *colormap.ColorControl
-	lutSt        *shaders.LUT16State
+	mu          sync.Mutex
+	name        string
+	visible     bool
+	zVal        float32
+	smooth      bool
+	newestAtTop bool // true（默认）：最新推入帧在顶部向下瀑布滚动；false：最新帧在底部向上推进
+	opacity     float32
+	cols, rows  int
+	x0, x1      float64
+	y0, y1      float64
+	baseMin     float64
+	baseMax     float64
+	invBaseSpan float64
+	writeRow    int
+	filledRows  int
+	raw         []float64
+	rgba        *image.RGBA
+	bmp         *ui.Bitmap
+	dirtyGPU    bool
+	histSubTick uint32
+	seq         atomic.Uint64
+	wakeArmed   atomic.Bool
+	wakeFn      func()
+	ctrl        *colormap.ColorControl
+	lutSt       *shaders.LUT16State
 }
 
 // NewWaterfall 创建列宽为 cols（频率/空间采样点数）、历史深度为 rows（时间帧行数）、纹理编码量程为 [baseMin, baseMax] 的环形瀑布图。
@@ -459,11 +459,11 @@ func NewWaterfall(cols, rows int, baseMin, baseMax float64, opts ...ImageOption)
 	}
 }
 
-func (wf *WaterfallItem) ZValue() float32      { return wf.zVal }
-func (wf *WaterfallItem) Visible() bool        { return wf.visible }
-func (wf *WaterfallItem) SetVisible(v bool)    { wf.visible = v }
-func (wf *WaterfallItem) LegendName() string   { return wf.name }
-func (wf *WaterfallItem) LegendColor() ui.Color { return wf.ctrl.Colormap().At(0.8) }
+func (wf *WaterfallItem) ZValue() float32                 { return wf.zVal }
+func (wf *WaterfallItem) Visible() bool                   { return wf.visible }
+func (wf *WaterfallItem) SetVisible(v bool)               { wf.visible = v }
+func (wf *WaterfallItem) LegendName() string              { return wf.name }
+func (wf *WaterfallItem) LegendColor() ui.Color           { return wf.ctrl.Colormap().At(0.8) }
 func (wf *WaterfallItem) Control() *colormap.ColorControl { return wf.ctrl }
 
 // SetNewestAtTop 控制瀑布流方向（true：最新谱线位于顶部向下滚动；false：最新谱线位于底部）。

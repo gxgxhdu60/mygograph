@@ -135,7 +135,7 @@ func TestMultiRingScanWindowB8BlockAndNaNAccuracy(t *testing.T) {
 		blk1[0][i] = math.Sin(float64(i) * 0.1)
 		blk1[1][i] = -0.5 * math.Cos(float64(i)*0.07)
 	}
-	blk1[0][123] = 42.5  // 正尖峰毛刺（落入 B=8 块内部）
+	blk1[0][123] = 42.5   // 正尖峰毛刺（落入 B=8 块内部）
 	blk1[0][124] = -37.25 // 负尖峰毛刺
 	blk1[1][200] = math.NaN()
 	blk1[1][201] = 19.75

@@ -519,6 +519,13 @@ func (m *MultiRingBuffer) Count() int {
 	return c
 }
 
+// T0 返回首个采样点的物理时间基准（由 Reset(t0) 设定，擦除扫描模式的周期相位以此为原点）。
+func (m *MultiRingBuffer) T0() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.t0Base
+}
+
 // LatestTime 返回最新同步采样帧的时间戳。
 func (m *MultiRingBuffer) LatestTime() float64 {
 	m.mu.RLock()

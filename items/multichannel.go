@@ -130,6 +130,11 @@ type MultiChannelItem struct {
 	selected        int
 	soloCh          int
 
+	// 进入 Solo 前的 Y 轴视口快照（独立于 ViewBox 缩放历史栈，避免与框选缩放互相干扰，且还原时不触碰 X 轴实时跟随状态）
+	preSoloY0, preSoloY1 float64
+	preSoloAutoY         bool
+	hasPreSolo           bool
+
 	// L 型物理标尺零分配文本缓存
 	lastCalAmpVal  float64
 	lastCalTimeVal float64
@@ -295,7 +300,7 @@ func (mc *MultiChannelItem) ChannelGain(ch int) float64 {
 
 // SetChannelGain 设置单导联独立幅值倍率（例如在 ±100μV 脑电视图中将 mV 级 ECG 导联设为 0.1 倍）。
 func (mc *MultiChannelItem) SetChannelGain(ch int, factor float64) *MultiChannelItem {
-	if ch >= 0 && ch < len(mc.chGains) {
+	if ch >= 0 && ch < len(mc.chGains) && !math.IsNaN(factor) {
 		f := float32(min(max(factor, 0.001), 1000.0))
 		mc.chGains[ch] = f
 		mc.recheckCustomChGains()
@@ -339,22 +344,34 @@ func (mc *MultiChannelItem) UnmuteAllChannels() {
 func (mc *MultiChannelItem) SoloChannel() int { return mc.soloCh }
 
 // SetSoloChannel 切换指定导联进入单导联置顶独奏放大（传 -1 恢复全导联视图）。
+// 仅改动 Y 轴：进入时快照当前 Y 视口，还原时精确恢复（原为自动量程则重新激活 Y 自动量程），X 轴实时跟随/历史回看状态保持不变。
 func (mc *MultiChannelItem) SetSoloChannel(ch int, vb *mygograph.ViewBox) {
 	if mc.ring == nil {
 		return
 	}
 	nCh := mc.ring.Channels()
 	if ch < 0 || ch >= nCh {
+		if mc.soloCh < 0 {
+			return
+		}
 		mc.soloCh = -1
 		if vb != nil {
-			if !vb.PopZoom() {
+			switch {
+			case mc.hasPreSolo && mc.preSoloAutoY:
+				vb.EnableAutoRange(mygograph.AxisY)
+			case mc.hasPreSolo:
+				vb.SetYRange(mc.preSoloY0, mc.preSoloY1, 0)
+			default:
 				vb.SetYRange(-0.8, float64(nCh-1)+0.8, 0)
 			}
 		}
+		mc.hasPreSolo = false
 		return
 	}
 	if mc.soloCh < 0 && vb != nil {
-		vb.PushZoom()
+		mc.preSoloY0, mc.preSoloY1 = vb.YRange()
+		mc.preSoloAutoY = vb.IsAutoY()
+		mc.hasPreSolo = true
 	}
 	mc.soloCh = ch
 	mc.SetSelectedChannel(ch)
@@ -431,23 +448,16 @@ func (mc *MultiChannelItem) HandlePointer(ev ui.InputEvent, lx, ly, pw, ph float
 	if ev.Kind != ui.InputPointerDown || ev.Button != 0 || ev.Clicks < 2 || mc.ring == nil {
 		return false
 	}
-	nCh := mc.ring.Channels()
 	if mc.soloCh >= 0 {
-		mc.soloCh = -1
-		if !vb.PopZoom() {
-			vb.SetYRange(-0.8, float64(nCh-1)+0.8, 0)
-		}
+		mc.SetSoloChannel(-1, vb)
 		return true
 	}
 	_, dy := vb.LocalToData(lx, ly, pw, ph)
 	ch := int(math.Round(dy))
-	if ch < 0 || ch >= nCh {
+	if ch < 0 || ch >= mc.ring.Channels() {
 		return false
 	}
-	mc.soloCh = ch
-	mc.SetSelectedChannel(ch)
-	vb.PushZoom()
-	vb.SetYRange(float64(ch)-0.85, float64(ch)+0.85, 0)
+	mc.SetSoloChannel(ch, vb)
 	return true
 }
 
@@ -726,13 +736,10 @@ func (mc *MultiChannelItem) DrawOverlay(rc *mygograph.RenderContext) {
 		return
 	}
 
-	// 计算参考导联（Solo 优先 -> 选中导联次之 -> 全局默认）每物理单位（如 1 V）对应的屏幕像素高度
+	// 计算参考导联每物理单位（如 1 V）对应的屏幕像素高度：仅 Solo 独奏时采用该导联独立倍率；
+	// 全导联视图一律按全局灵敏度标定（选中导联不参与，避免混采 ECG 的 0.1x 倍率误标到全部 EEG 导联上）
 	refChGain := 1.0
-	refCh := mc.soloCh
-	if refCh < 0 {
-		refCh = mc.selected
-	}
-	if refCh >= 0 && refCh < len(mc.chGains) {
+	if refCh := mc.soloCh; refCh >= 0 && refCh < len(mc.chGains) {
 		refChGain = float64(mc.chGains[refCh])
 	}
 	lanePx := float64(pr.H) / ySpan
@@ -850,7 +857,8 @@ func (mc *MultiChannelItem) BuildContextMenu(m *ui.Menu, lx, ly, plotW, plotH fl
 		if sub.Item("Sweep Mode (Erase-Bar)").Radio(mc.mode == DisplaySweepMode).Chosen() {
 			mc.SetDisplayMode(DisplaySweepMode)
 			if vb != nil {
-				vb.SetXRange(0, mc.windowSec, 0)
+				// 扫描模式 Bounds 固定为 [0, windowSec] 且 X 轴自动量程零留白，保持 autoX 避免误显 [A]/[Live] 角标
+				vb.EnableAutoRange(mygograph.AxisX)
 			}
 		}
 		if sub.Item("Roll Paper Mode (Live Follow)").Radio(mc.mode == DisplayRollMode).Chosen() {
@@ -889,11 +897,7 @@ func (mc *MultiChannelItem) BuildContextMenu(m *ui.Menu, lx, ly, plotW, plotH fl
 			if sub.Item(p.label).Radio(active).Chosen() {
 				mc.SetWindowSeconds(p.sec)
 				if vb != nil {
-					if mc.mode == DisplaySweepMode {
-						vb.SetXRange(0, p.sec, 0)
-					} else {
-						vb.EnableAutoRange(mygograph.AxisX)
-					}
+					vb.EnableAutoRange(mygograph.AxisX)
 				}
 			}
 		}

@@ -25,11 +25,22 @@ type Viewable interface {
 	View(c *ui.Context) ui.Element
 }
 
+// liveStateHolder 由持有窗口宿主服务与交互布局状态的组件（*Plot、*GraphLayout）实现：
+// snapshotLiveState 保存当前状态并返回恢复函数。
+type liveStateHolder interface {
+	snapshotLiveState() (restore func())
+}
+
 // RenderWidget 在无窗口离屏环境下按指定逻辑尺寸（width × height DIP）与超采样倍率（scale，如 2.0 对应 Retina / 3.0 对应论文级 300DPI）
 // 渲染任意图表组件，返回物理分辨率为 (width*scale) × (height*scale) 的 *image.RGBA 位图。
 func RenderWidget(w Viewable, width, height int, scale float32) *image.RGBA {
 	if w == nil {
 		return image.NewRGBA(image.Rect(0, 0, max(width, 1), max(height, 1)))
+	}
+	// 离屏渲染会复用同一组件实例执行 View/布局/绘制，期间会覆盖其宿主 Services、布局命中框与流式节流时钟；
+	// 导出前快照、导出后恢复，避免正在窗口中显示的实时图表在导出后丢失重绘唤醒或命中错位。
+	if h, ok := w.(liveStateHolder); ok {
+		defer h.snapshotLiveState()()
 	}
 	return RenderFunc(func(c *ui.Context) {
 		w.View(c)

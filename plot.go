@@ -177,6 +177,8 @@ type Plot struct {
 	lastStreamSum  uint64
 	lastStreamMove time.Time
 	extraMenu      func(m *ui.Menu)
+	exportPath     string
+	exportHook     func(path string, err error)
 	lastCSVExport  string
 }
 
@@ -316,6 +318,53 @@ func (p *Plot) ResumeLiveFollow() {
 	p.vb.EnableAutoRange(AxisX)
 	p.updateAutoRangeFromItems()
 	p.Invalidate()
+}
+
+// SetPNGExportPath 设置右键菜单 "Export High-DPI PNG (2x)" 的输出文件路径（默认当前工作目录下 mygograph_export_2x.png）。
+func (p *Plot) SetPNGExportPath(path string) *Plot {
+	p.exportPath = path
+	return p
+}
+
+// SetPNGExportHook 注册右键菜单 PNG 导出完成回调（path 为实际输出路径，err 为失败原因），供业务层提示用户或改为弹出保存对话框。
+func (p *Plot) SetPNGExportHook(fn func(path string, err error)) *Plot {
+	p.exportHook = fn
+	return p
+}
+
+// snapshotLiveState 实现 liveStateHolder：快照宿主 Services、布局命中框、悬停与流式节流状态，返回恢复函数。
+func (p *Plot) snapshotLiveState() func() {
+	type liveState struct {
+		services                          ui.Services
+		lastMods                          ui.Modifiers
+		elemW, elemH                      float32
+		plotR, leftR, rightR, topR, botR  ui.Rect
+		autoBtnRect, liveBtnRect          ui.Rect
+		hasAutoBtn, hasLiveBtn, pointerIn bool
+		hoverX, hoverY                    float32
+		hoverCursor                       ui.Cursor
+		lastStreamSum                     uint64
+		lastStreamMove                    time.Time
+	}
+	st := liveState{
+		p.services, p.lastMods, p.elemW, p.elemH,
+		p.localPlotRect, p.localLeftAx, p.localRightAx, p.localTopAx, p.localBotAx,
+		p.autoBtnRect, p.liveBtnRect, p.hasAutoBtn, p.hasLiveBtn, p.pointerIn,
+		p.hoverX, p.hoverY, p.hoverCursor, p.lastStreamSum, p.lastStreamMove,
+	}
+	hits := append([]legendHitBox(nil), p.legendHits...)
+	return func() {
+		p.services, p.lastMods, p.elemW, p.elemH = st.services, st.lastMods, st.elemW, st.elemH
+		p.localPlotRect, p.localLeftAx, p.localRightAx, p.localTopAx, p.localBotAx = st.plotR, st.leftR, st.rightR, st.topR, st.botR
+		p.autoBtnRect, p.liveBtnRect, p.hasAutoBtn, p.hasLiveBtn, p.pointerIn = st.autoBtnRect, st.liveBtnRect, st.hasAutoBtn, st.hasLiveBtn, st.pointerIn
+		p.hoverX, p.hoverY, p.hoverCursor = st.hoverX, st.hoverY, st.hoverCursor
+		p.lastStreamSum, p.lastStreamMove = st.lastStreamSum, st.lastStreamMove
+		p.legendHits = append(p.legendHits[:0], hits...)
+		// 离屏渲染器可能已改写网格缓存画布内容，强制窗口下一帧重建
+		p.gridCanvas = nil
+		p.gridKey = gridCacheKey{}
+		p.Invalidate()
+	}
 }
 
 // SetContextMenuHook 注册业务层自定义右键菜单扩展项。
@@ -742,9 +791,9 @@ func (p *Plot) drawLegend(painter *ui.Painter, elemRect, plotRect ui.Rect) {
 	lm := lf.Metrics()
 	rowH := max(lm.Ascent+lm.Descent+6, 18)
 	const (
-		padX     float32 = 8
-		padY     float32 = 6
-		swatchW  float32 = 16
+		padX      float32 = 8
+		padY      float32 = 6
+		swatchW   float32 = 16
 		swatchGap float32 = 6
 	)
 
@@ -1290,7 +1339,14 @@ func (p *Plot) buildContextMenu(m *ui.Menu) {
 	if m.Item("Export High-DPI PNG (2x)").Chosen() {
 		w := max(int(p.elemW), 800)
 		h := max(int(p.elemH), 480)
-		_ = p.SavePNG("mygograph_export_2x.png", w, h, 2.0)
+		path := p.exportPath
+		if path == "" {
+			path = "mygograph_export_2x.png"
+		}
+		err := p.SavePNG(path, w, h, 2.0)
+		if p.exportHook != nil {
+			p.exportHook(path, err)
+		}
 	}
 
 	if p.extraMenu != nil {

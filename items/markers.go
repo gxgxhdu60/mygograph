@@ -119,9 +119,9 @@ func (sb *ScaleBarItem) Bounds() (data.Range, data.Range, bool) {
 	return data.Range{}, data.Range{}, false
 }
 
-func (sb *ScaleBarItem) Visible() bool     { return sb.visible }
-func (sb *ScaleBarItem) SetVisible(v bool) { sb.visible = v }
-func (sb *ScaleBarItem) ZValue() float32   { return sb.z }
+func (sb *ScaleBarItem) Visible() bool                   { return sb.visible }
+func (sb *ScaleBarItem) SetVisible(v bool)               { sb.visible = v }
+func (sb *ScaleBarItem) ZValue() float32                 { return sb.z }
 func (sb *ScaleBarItem) Draw(_ *mygograph.RenderContext) {}
 
 // DrawOverlay 在视口角落自适应渲染整档 L 型比例标尺。
@@ -292,8 +292,8 @@ func (em *EventMarkersItem) Draw(rc *mygograph.RenderContext) {
 		winSec = max(em.hostMC.WindowSeconds(), 1e-6)
 		eraseGap = em.hostMC.eraseGapSec
 		tLatest = ring.LatestTime()
-		// 与 MultiRingBuffer.PackShaderEnvelope 保持严格一致的扫描相位对齐
-		t0Base = 0
+		// 与 MultiRingBuffer.PackShaderEnvelope 保持严格一致的扫描相位对齐（以 Reset(t0) 设定的时间基准为周期原点）
+		t0Base = ring.T0()
 		relNow := max(tLatest-t0Base, 0)
 		cycleIdx := math.Floor(relNow / winSec)
 		cycleStart = t0Base + cycleIdx*winSec

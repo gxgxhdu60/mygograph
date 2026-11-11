@@ -30,12 +30,12 @@ const (
 // ViewLimits 限定视口可漫游与缩放的物理边界及最小/最大跨度（避免无限缩小溢出或过度放大坍缩）。
 // 未设置项使用 math.NaN()（边界）或 0（跨度）表示不限制。
 type ViewLimits struct {
-	XMin, XMax       float64
-	YMin, YMax       float64
-	MinXSpan         float64
-	MaxXSpan         float64
-	MinYSpan         float64
-	MaxYSpan         float64
+	XMin, XMax float64
+	YMin, YMax float64
+	MinXSpan   float64
+	MaxXSpan   float64
+	MinYSpan   float64
+	MaxYSpan   float64
 }
 
 // DefaultViewLimits 返回未绑定硬边界但带安全最小跨度（1e-15）的默认视口限制。

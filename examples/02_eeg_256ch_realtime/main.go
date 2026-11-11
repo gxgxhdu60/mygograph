@@ -101,8 +101,8 @@ func main() {
 		items.WithDCRemoval(true),
 		items.WithScaleBar(true),
 	)
-	mc.SetChannelMuted(4, true)            // 预设第 5 导联为接触不良坏道灰化
-	mc.SetChannelSensitivity(19, 2.0e-3)   // 第 20 导联 (ECG-II) 独立设为 2 mV/ch（0.1x 衰减与 μV 级脑电同屏清晰共显）
+	mc.SetChannelMuted(4, true)          // 预设第 5 导联为接触不良坏道灰化
+	mc.SetChannelSensitivity(19, 2.0e-3) // 第 20 导联 (ECG-II) 独立设为 2 mV/ch（0.1x 衰减与 μV 级脑电同屏清晰共显）
 
 	markers := items.NewEventMarkers(items.WithMarkersMultiChannel(mc))
 	markers.Push(1.13, "Spike", ui.RGB(248, 113, 113))
@@ -149,7 +149,7 @@ func main() {
 						plot.ResumeLiveFollow()
 					} else {
 						mc.SetDisplayMode(items.DisplaySweepMode)
-						plot.ViewBox().SetXRange(0, mc.WindowSeconds(), 0)
+						plot.ResumeLiveFollow()
 					}
 					plot.Invalidate()
 				}
