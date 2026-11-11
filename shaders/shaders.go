@@ -12,6 +12,15 @@ import (
 //go:embed lut16.kage
 var lut16Src string
 
+//go:embed multistack.kage
+var multiStackSrc string
+
+// MultiStackFlags 定义 multistack.kage 的控制位掩码。
+const (
+	MultiStackFlagInvertY      int32 = 1 << 0 // 临床脑电图惯例：0 号导联位于顶部向下排列
+	MultiStackFlagShowZeroLine int32 = 1 << 1 // 绘制每导联微弱零点基线
+)
+
 // LUT16Flags 定义 lut16.kage 的行为控制位掩码。
 const (
 	LUT16FlagFlipY   int32 = 1 << 0 // 将第 0 行置于物理坐标系底部（YMin）
@@ -132,4 +141,102 @@ func PackRow16(dstPix []byte, src []float64, baseMin, invBaseSpan float64) {
 		dstPix[off+2] = 255
 		dstPix[off+3] = 255
 	}
+}
+
+// MultiStackProgram 封装 64~256 导联单次 DrawCall SDF 抗锯齿波形着色器及预解析 Uniform 句柄。
+type MultiStackProgram struct {
+	Shader        *shader.Shader
+	NumChannels   shader.Uniform
+	ViewYMin      shader.Uniform
+	ViewYSpan     shader.Uniform
+	MaxLaneAmp    shader.Uniform
+	HalfStroke    shader.Uniform
+	OverlapRadius shader.Uniform
+	Flags         shader.Uniform
+}
+
+var (
+	multiStackOnce sync.Once
+	multiStackProg *MultiStackProgram
+)
+
+// MultiStack 返回全局单例编译的多导联高密度波形着色器。
+func MultiStack() *MultiStackProgram {
+	multiStackOnce.Do(func() {
+		s := shader.MustCompile(multiStackSrc)
+		multiStackProg = &MultiStackProgram{
+			Shader:        s,
+			NumChannels:   s.Uniform("NumChannels"),
+			ViewYMin:      s.Uniform("ViewYMin"),
+			ViewYSpan:     s.Uniform("ViewYSpan"),
+			MaxLaneAmp:    s.Uniform("MaxLaneAmp"),
+			HalfStroke:    s.Uniform("HalfStroke"),
+			OverlapRadius: s.Uniform("OverlapRadius"),
+			Flags:         s.Uniform("Flags"),
+		}
+	})
+	return multiStackProg
+}
+
+// MultiStackState 为单个 MultiChannelItem 持久持有的零分配 Uniform 槽位状态。
+type MultiStackState struct {
+	prog   *MultiStackProgram
+	values *shader.Values
+}
+
+// NewMultiStackState 创建零分配多导联着色器状态。
+func NewMultiStackState() *MultiStackState {
+	p := MultiStack()
+	return &MultiStackState{
+		prog:   p,
+		values: p.Shader.NewValues(),
+	}
+}
+
+// Draw 执行单次 DrawCall 批量渲染全部高密度导联波形。
+func (st *MultiStackState) Draw(
+	painter *ui.Painter,
+	rect ui.Rect,
+	envBmp *ui.Bitmap,
+	paletteBmp *ui.Bitmap,
+	numChannels int32,
+	viewYMin, viewYSpan float32,
+	maxLaneAmp float32,
+	halfStroke float32,
+	overlapRadius int32,
+	flags int32,
+) {
+	if envBmp == nil || paletteBmp == nil || rect.W <= 0 || rect.H <= 0 || numChannels <= 0 {
+		return
+	}
+	pr := st.prog
+	st.values.
+		Int(pr.NumChannels, numChannels).
+		Float(pr.ViewYMin, viewYMin).
+		Float(pr.ViewYSpan, viewYSpan).
+		Float(pr.MaxLaneAmp, maxLaneAmp).
+		Float(pr.HalfStroke, halfStroke).
+		Int(pr.OverlapRadius, overlapRadius).
+		Int(pr.Flags, flags)
+
+	pr.Shader.Draw(painter, rect, shader.Options{
+		Values: st.values,
+		Images: [4]*ui.Bitmap{envBmp, paletteBmp, nil, nil},
+	})
+}
+
+// EncodeSignedLane16 将相对于导联基线的有向偏移 laneVal ∈ [-maxLaneAmp, +maxLaneAmp]
+// 编码为精确以 32768 为零点的 16-bit RGBA 纹素（B=255 表示有效，A=255 防预乘截断）。
+func EncodeSignedLane16(dst4 []byte, laneVal, invMaxLaneAmp float32) {
+	norm := laneVal * invMaxLaneAmp
+	if norm < -1 {
+		norm = -1
+	} else if norm > 1 {
+		norm = 1
+	}
+	q := uint16(32768.0 + norm*32767.0 + 0.5)
+	dst4[0] = uint8(q >> 8)
+	dst4[1] = uint8(q)
+	dst4[2] = 255
+	dst4[3] = 255
 }

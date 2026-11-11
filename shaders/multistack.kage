@@ -1,0 +1,126 @@
+//go:build ignore
+
+package main
+
+// NumChannels 为总导联数 C（image0 高度为 2*C，image1 尺寸为 C*1）。
+var NumChannels int
+
+// ViewYMin 与 ViewYSpan 描述当前 ViewBox 在导联物理坐标系中的可见纵向区间 [ViewYMin, ViewYMin+ViewYSpan]。
+var ViewYMin float
+var ViewYSpan float
+
+// MaxLaneAmp 定义 16-bit 纹理单侧编码的最大跨导联振幅倍数（如 4.0 表示允许越界相邻 ±4 个导联而不截断）。
+var MaxLaneAmp float
+
+// HalfStroke 为波形半线宽（DIP 单位，如 0.65 对应约 1.3px 抗锯齿线宽）。
+var HalfStroke float
+
+// OverlapRadius 控制每个像素向上下邻近导联搜索大振幅越界尖峰的半径（范围 0..4）。
+var OverlapRadius int
+
+// Flags 位掩码：
+// bit 0 (1): InvertY（临床脑电图惯例：0 号导联 Fp1 在顶部，向下递增）
+// bit 1 (2): ShowZeroLine（绘制每导联微弱基线参考线）
+var Flags int
+
+func decodeSigned16(px vec4) (float, float) {
+	if px.b < 0.5 {
+		return 0.0, 0.0
+	}
+	hi := floor(px.r*255.0 + 0.5)
+	lo := floor(px.g*255.0 + 0.5)
+	q := hi*256.0 + lo
+	return ((q - 32768.0) / 32767.0) * MaxLaneAmp, 1.0
+}
+
+func Fragment(dst vec4, pos vec2) vec4 {
+	rs := rectSize()
+	if rs.x <= 0.0 || rs.y <= 0.0 || ViewYSpan <= 0.0 || NumChannels <= 0 {
+		return vec4(0.0)
+	}
+	texSize := image0Size()
+	if texSize.x <= 0.0 {
+		return vec4(0.0)
+	}
+
+	col := clamp(floor((pos.x/rs.x)*texSize.x), 0.0, texSize.x-1.0)
+	prevCol := max(col-1.0, 0.0)
+
+	ny := pos.y / rs.y
+	var yData float
+	if (Flags & 1) != 0 {
+		yData = ViewYMin + ny*ViewYSpan
+	} else {
+		yData = ViewYMin + (1.0-ny)*ViewYSpan
+	}
+
+	laneInPx := rs.y / ViewYSpan
+	baseCh := int(floor(yData + 0.5))
+
+	outColor := vec4(0.0)
+
+	// 可选绘制当前最近导联的微弱零点基线
+	if (Flags&2) != 0 && baseCh >= 0 && baseCh < NumChannels {
+		baseDistPx := abs(yData-float(baseCh)) * laneInPx
+		if baseDistPx < 0.65 {
+			outColor = vec4(0.18, 0.22, 0.30, 0.35)
+		}
+	}
+
+	maxReach := MaxLaneAmp + (HalfStroke+1.0)/max(laneInPx, 1e-4)
+
+	// 固定展开 [-4, +4] 邻域导联搜索，带几何早退与惰性前驱采样，兼顾跨导联大振幅棘波与软件/GPU 极致吞吐
+	for k := -4; k <= 4; k++ {
+		if k < -OverlapRadius || k > OverlapRadius {
+			continue
+		}
+		ch := baseCh + k
+		if ch < 0 || ch >= NumChannels {
+			continue
+		}
+		if abs(yData-float(ch)) > maxReach {
+			continue
+		}
+
+		rowMin := float(ch*2) + 0.5
+		rowMax := float(ch*2+1) + 0.5
+		vMin, valid := decodeSigned16(image0At(vec2(col+0.5, rowMin)))
+		if valid < 0.5 {
+			// 命中未填充区域或擦除扫描空白带（Sweep Erase Gap），直接跳过实现干净断点
+			continue
+		}
+		vMax, _ := decodeSigned16(image0At(vec2(col+0.5, rowMax)))
+
+		segLo := vMin
+		segHi := vMax
+		yLo := float(ch) + segLo
+		yHi := float(ch) + segHi
+		distPx := max(max((yData-yHi)*laneInPx, (yLo-yData)*laneInPx), 0.0)
+
+		// 仅当本列包络未完全覆盖当前像素时，才惰性读取前一列包络衔接陡峭边沿（节省 >75% 纹理采样）
+		if distPx > HalfStroke-0.55 && col > 0.5 {
+			pMin, pValid := decodeSigned16(image0At(vec2(prevCol+0.5, rowMin)))
+			if pValid > 0.5 {
+				pMax, _ := decodeSigned16(image0At(vec2(prevCol+0.5, rowMax)))
+				if pMax < segLo {
+					segLo = pMax
+				}
+				if pMin > segHi {
+					segHi = pMin
+				}
+				yLo = float(ch) + segLo
+				yHi = float(ch) + segHi
+				distPx = max(max((yData-yHi)*laneInPx, (yLo-yData)*laneInPx), 0.0)
+			}
+		}
+
+		cov := 1.0 - smoothstep(HalfStroke-0.55, HalfStroke+0.55, distPx)
+		if cov > 0.004 {
+			chCol := image1At(vec2(float(ch)+0.5, 0.5))
+			src := chCol * cov
+			outColor = src + outColor*(1.0-src.a)
+		}
+	}
+
+	return outColor
+}

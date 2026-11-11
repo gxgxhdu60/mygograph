@@ -257,25 +257,57 @@ func (r *RingBuffer) DecimateWindow(tStart, tEnd float64, buckets int, dst []Min
 
 // MultiRingBuffer 面向 16~256 通道同步采集流的高吞吐环形缓冲区。
 //
-// 内存布局优化：采用通道主序（Channel-Major）连续存储 data[ch*capPerCh + slot]，
-// 使单通道在时间窗口内的数千点降采样扫描 100% 顺序命中 CPU L1/L2 缓存行，杜绝跨步缓存失效。
+// 内存布局优化：
+//   - 采用通道主序（Channel-Major）连续存储 data[ch*capPerCh + slot]，使单通道窗口扫描 100% 顺序命中缓存行；
+//   - 同步维护 IEEE-754 保序 int32 镜像层（ord32，总活跃工作集约 10MB 常驻 L3 缓存）与 B=8 分块极值摘要（blkMin/blkMax），
+//     配合全通道共享的像素桶跨度表预计算，将 256 通道 × 1kHz × 10s 实时包络提取压缩至亚毫秒级（0 allocs/op）。
 type MultiRingBuffer struct {
-	mu         sync.RWMutex
-	channels   int
-	capPerCh   int
-	buf        []float64 // 长度 = channels * capPerCh
-	names      []string
-	head       int
-	count      int
-	total      int64
-	t0Base     float64
-	sampleRate float64
-	dt         float64
+	mu           sync.RWMutex
+	channels     int
+	capPerCh     int
+	nBlk         int
+	buf          []float64 // 长度 = channels * capPerCh（保留完整 float64 原始采样精度）
+	ord32        []int32   // 长度 = channels * capPerCh（IEEE-754 保序 float32 键，支持无分支 CMOV 极值聚合）
+	blkMin       []int32   // 长度 = channels * nBlk（B=8 分块保序最小键）
+	blkMax       []int32   // 长度 = channels * nBlk（B=8 分块保序最大键）
+	nonFiniteCnt []int     // 各通道当前环形槽位内非有限值（NaN/Inf）计数
+	names        []string
+	head         int
+	count        int
+	total        int64
+	t0Base       float64
+	sampleRate   float64
+	dt           float64
 
 	ver       atomic.Uint64
 	wakeArmed atomic.Bool
 	wakeMu    sync.RWMutex
 	wakeFn    func()
+}
+
+const (
+	ringBlkShift = 3
+	ringBlkSize  = 1 << ringBlkShift // B = 8
+	ord32Invalid = int32(-1 << 31)   // math.MinInt32，严格小于一切有限 float32 的保序键 [-0x7f800000, 0x7f7fffff]
+)
+
+func float64ToOrd32(v float64) int32 {
+	if !isFinite(v) {
+		return ord32Invalid
+	}
+	f := float32(v)
+	if math.IsInf(float64(f), 1) {
+		f = math.MaxFloat32
+	} else if math.IsInf(float64(f), -1) {
+		f = -math.MaxFloat32
+	}
+	b := int32(math.Float32bits(f))
+	return b ^ int32(uint32(b>>31)>>1)
+}
+
+func ord32ToFloat32(k int32) float32 {
+	b := uint32(k ^ int32(uint32(k>>31)>>1))
+	return math.Float32frombits(b)
 }
 
 // NewMultiRingBuffer 创建多通道同步环形缓冲区。
@@ -301,17 +333,23 @@ func NewMultiRingBufferPerChannel(channels int, sampleRate float64, samplesPerCh
 	if sampleRate <= 0 || !isFinite(sampleRate) {
 		sampleRate = 1.0
 	}
+	nBlk := (samplesPerChannel + ringBlkSize - 1) >> ringBlkShift
 	names := make([]string, channels)
 	for i := range channels {
 		names[i] = fmt.Sprintf("Ch%02d", i+1)
 	}
 	return &MultiRingBuffer{
-		channels:   channels,
-		capPerCh:   samplesPerChannel,
-		buf:        make([]float64, channels*samplesPerChannel),
-		names:      names,
-		sampleRate: sampleRate,
-		dt:         1.0 / sampleRate,
+		channels:     channels,
+		capPerCh:     samplesPerChannel,
+		nBlk:         nBlk,
+		buf:          make([]float64, channels*samplesPerChannel),
+		ord32:        make([]int32, channels*samplesPerChannel),
+		blkMin:       make([]int32, channels*nBlk),
+		blkMax:       make([]int32, channels*nBlk),
+		nonFiniteCnt: make([]int, channels),
+		names:        names,
+		sampleRate:   sampleRate,
+		dt:           1.0 / sampleRate,
 	}
 }
 
@@ -351,6 +389,12 @@ func (m *MultiRingBuffer) notifyWake() {
 // Reset 清空所有通道历史样本并重设起始时间基准 t0。
 func (m *MultiRingBuffer) Reset(t0 float64) {
 	m.mu.Lock()
+	for ch := range m.channels {
+		if m.nonFiniteCnt[ch] != 0 {
+			clear(m.ord32[ch*m.capPerCh : (ch+1)*m.capPerCh])
+			m.nonFiniteCnt[ch] = 0
+		}
+	}
 	m.head = 0
 	m.count = 0
 	m.total = 0
@@ -358,6 +402,88 @@ func (m *MultiRingBuffer) Reset(t0 float64) {
 	m.ver.Add(1)
 	m.mu.Unlock()
 	m.notifyWake()
+}
+
+func (m *MultiRingBuffer) recomputeChannelBlocks(ch, startSlot, countSlots int) {
+	if countSlots <= 0 {
+		return
+	}
+	capCh := m.capPerCh
+	nBlk := m.nBlk
+	chOrd := m.ord32[ch*capCh : (ch+1)*capCh]
+	chBMin := m.blkMin[ch*nBlk : (ch+1)*nBlk]
+	chBMax := m.blkMax[ch*nBlk : (ch+1)*nBlk]
+	bStart := startSlot >> ringBlkShift
+	bEnd := (startSlot + countSlots - 1) >> ringBlkShift
+
+	if m.nonFiniteCnt[ch] == 0 {
+		for blk := bStart; blk <= bEnd; blk++ {
+			s0 := blk << ringBlkShift
+			if s0+ringBlkSize <= capCh {
+				s := chOrd[s0 : s0+ringBlkSize : s0+ringBlkSize]
+				mn := min(min(min(s[0], s[1]), min(s[2], s[3])), min(min(s[4], s[5]), min(s[6], s[7])))
+				mx := max(max(max(s[0], s[1]), max(s[2], s[3])), max(max(s[4], s[5]), max(s[6], s[7])))
+				chBMin[blk] = mn
+				chBMax[blk] = mx
+			} else {
+				s := chOrd[s0:capCh]
+				mn, mx := s[0], s[0]
+				for i := 1; i < len(s); i++ {
+					mn = min(mn, s[i])
+					mx = max(mx, s[i])
+				}
+				chBMin[blk] = mn
+				chBMax[blk] = mx
+			}
+		}
+		return
+	}
+
+	for blk := bStart; blk <= bEnd; blk++ {
+		s0 := blk << ringBlkShift
+		s1 := min(s0+ringBlkSize, capCh)
+		mn := int32(math.MaxInt32)
+		mx := ord32Invalid
+		has := false
+		for _, k := range chOrd[s0:s1] {
+			if k != ord32Invalid {
+				mn = min(mn, k)
+				mx = max(mx, k)
+				has = true
+			}
+		}
+		if has {
+			chBMin[blk] = mn
+			chBMax[blk] = mx
+		} else {
+			chBMin[blk] = ord32Invalid
+			chBMax[blk] = ord32Invalid
+		}
+	}
+}
+
+func (m *MultiRingBuffer) writeChannelContig(ch, dstSlot int, src []float64) {
+	n := len(src)
+	if n == 0 {
+		return
+	}
+	base := ch*m.capPerCh + dstSlot
+	copy(m.buf[base:base+n], src)
+	ordDst := m.ord32[base : base+n]
+	hadNF := m.nonFiniteCnt[ch] > 0
+	nfDelta := 0
+	for i, v := range src {
+		if hadNF && ordDst[i] == ord32Invalid {
+			nfDelta--
+		}
+		k := float64ToOrd32(v)
+		if k == ord32Invalid {
+			nfDelta++
+		}
+		ordDst[i] = k
+	}
+	m.nonFiniteCnt[ch] += nfDelta
+	m.recomputeChannelBlocks(ch, dstSlot, n)
 }
 
 // Channels 返回总通道数。
@@ -412,7 +538,18 @@ func (m *MultiRingBuffer) PushFrame(frame []float64) {
 	slot := m.head
 	capCh := m.capPerCh
 	for ch := range m.channels {
-		m.buf[ch*capCh+slot] = frame[ch]
+		idx := ch*capCh + slot
+		v := frame[ch]
+		m.buf[idx] = v
+		if m.nonFiniteCnt[ch] > 0 && m.ord32[idx] == ord32Invalid {
+			m.nonFiniteCnt[ch]--
+		}
+		k := float64ToOrd32(v)
+		if k == ord32Invalid {
+			m.nonFiniteCnt[ch]++
+		}
+		m.ord32[idx] = k
+		m.recomputeChannelBlocks(ch, slot, 1)
 	}
 	m.head = (slot + 1) % capCh
 	m.count = min(m.count+1, capCh)
@@ -436,14 +573,33 @@ func (m *MultiRingBuffer) PushInterleaved(interleaved []float64) {
 		startF = frames - capCh
 	}
 	keep := frames - startF
+	head0 := m.head
 	for f := range keep {
-		slot := (m.head + f) % capCh
+		slot := (head0 + f) % capCh
 		base := (startF + f) * chs
 		for ch := range chs {
-			m.buf[ch*capCh+slot] = interleaved[base+ch]
+			idx := ch*capCh + slot
+			v := interleaved[base+ch]
+			m.buf[idx] = v
+			if m.nonFiniteCnt[ch] > 0 && m.ord32[idx] == ord32Invalid {
+				m.nonFiniteCnt[ch]--
+			}
+			k := float64ToOrd32(v)
+			if k == ord32Invalid {
+				m.nonFiniteCnt[ch]++
+			}
+			m.ord32[idx] = k
 		}
 	}
-	m.head = (m.head + keep) % capCh
+	first := min(keep, capCh-head0)
+	rem := keep - first
+	for ch := range chs {
+		m.recomputeChannelBlocks(ch, head0, first)
+		if rem > 0 {
+			m.recomputeChannelBlocks(ch, 0, rem)
+		}
+	}
+	m.head = (head0 + keep) % capCh
 	m.count = min(m.count+keep, capCh)
 	m.total += int64(frames)
 	m.ver.Add(1)
@@ -467,8 +623,7 @@ func (m *MultiRingBuffer) PushChannelBlocks(blocks [][]float64) {
 	capCh := m.capPerCh
 	if n >= capCh {
 		for ch := range m.channels {
-			chSlice := m.buf[ch*capCh : (ch+1)*capCh]
-			copy(chSlice, blocks[ch][n-capCh:n])
+			m.writeChannelContig(ch, 0, blocks[ch][n-capCh:n])
 		}
 		m.head = 0
 		m.count = capCh
@@ -477,11 +632,10 @@ func (m *MultiRingBuffer) PushChannelBlocks(blocks [][]float64) {
 		first := min(n, capCh-m.head)
 		rem := n - first
 		for ch := range m.channels {
-			chSlice := m.buf[ch*capCh : (ch+1)*capCh]
 			src := blocks[ch][:n]
-			copy(chSlice[m.head:m.head+first], src[:first])
+			m.writeChannelContig(ch, m.head, src[:first])
 			if rem > 0 {
-				copy(chSlice[:rem], src[first:])
+				m.writeChannelContig(ch, 0, src[first:])
 			}
 		}
 		m.head = (m.head + n) % capCh
@@ -556,6 +710,390 @@ func (m *MultiRingBuffer) DecimateSweep(ch int, windowSec, eraseGapSec float64, 
 	return cursorNorm, valid
 }
 
+// DecimateChannelsWindow 在单次读锁临界区内批量聚合 [chStart, chEnd) 导联的滚动窗口像素包络（dst 长度需 >= (chEnd-chStart)*buckets）。
+func (m *MultiRingBuffer) DecimateChannelsWindow(chStart, chEnd int, tStart, tEnd float64, buckets int, dst []MinMax) int {
+	chStart = max(chStart, 0)
+	chEnd = min(chEnd, m.channels)
+	nCh := chEnd - chStart
+	if nCh <= 0 || buckets <= 0 || len(dst) < nCh*buckets || tEnd <= tStart {
+		return 0
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	totalValid := 0
+	for i := range nCh {
+		ch := chStart + i
+		chBuf := m.buf[ch*m.capPerCh : (ch+1)*m.capPerCh]
+		out := dst[i*buckets : (i+1)*buckets]
+		totalValid += decimateRingSlice(chBuf, m.capPerCh, m.head, m.count, m.total, m.t0Base, m.dt, tStart, tEnd, buckets, out)
+	}
+	return totalValid
+}
+
+// DecimateChannelsSweep 在单次读锁临界区内批量聚合 [chStart, chEnd) 导联的擦除扫描模式包络（dst 长度需 >= (chEnd-chStart)*buckets）。
+func (m *MultiRingBuffer) DecimateChannelsSweep(chStart, chEnd int, windowSec, eraseGapSec float64, buckets int, dst []MinMax) (cursorNorm float64, totalValid int) {
+	chStart = max(chStart, 0)
+	chEnd = min(chEnd, m.channels)
+	nCh := chEnd - chStart
+	if nCh <= 0 || buckets <= 0 || len(dst) < nCh*buckets || windowSec <= 0 {
+		return 0, 0
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	clear(dst[:nCh*buckets])
+	if m.count == 0 {
+		return 0, 0
+	}
+
+	tNow := m.t0Base + float64(m.total-1)*m.dt
+	relNow := tNow - m.t0Base
+	cycleIdx := math.Floor(relNow / windowSec)
+	cycleStart := m.t0Base + cycleIdx*windowSec
+	cursorPhase := relNow - cycleIdx*windowSec
+	cursorNorm = min(max(cursorPhase/windowSec, 0), 1)
+
+	newBuckets := int(math.Floor(cursorNorm * float64(buckets)))
+	gapFrac := max(eraseGapSec/windowSec, 0)
+	oldStartBucket := int(math.Ceil((cursorNorm + gapFrac) * float64(buckets)))
+
+	for i := range nCh {
+		ch := chStart + i
+		chBuf := m.buf[ch*m.capPerCh : (ch+1)*m.capPerCh]
+		out := dst[i*buckets : (i+1)*buckets]
+		if newBuckets > 0 {
+			tSegEnd := cycleStart + float64(newBuckets)/float64(buckets)*windowSec
+			totalValid += decimateRingSliceNoClear(chBuf, m.capPerCh, m.head, m.count, m.total, m.t0Base, m.dt, cycleStart, tSegEnd, newBuckets, out[:newBuckets])
+		} else {
+			totalValid += decimateRingSliceNoClear(chBuf, m.capPerCh, m.head, m.count, m.total, m.t0Base, m.dt, cycleStart, cycleStart+windowSec/float64(buckets), 1, out[:1])
+		}
+		if oldStartBucket < buckets {
+			oldBuckets := buckets - oldStartBucket
+			prevCycleStart := cycleStart - windowSec
+			tOldStart := prevCycleStart + float64(oldStartBucket)/float64(buckets)*windowSec
+			tOldEnd := prevCycleStart + windowSec
+			totalValid += decimateRingSliceNoClear(chBuf, m.capPerCh, m.head, m.count, m.total, m.t0Base, m.dt, tOldStart, tOldEnd, oldBuckets, out[oldStartBucket:buckets])
+		}
+	}
+	return cursorNorm, totalValid
+}
+
+// ScanWindowMinMax 在单次读锁内预计算一次像素桶跨度表，并利用 L3 驻留保序 int32 镜像层 + B=8 分块极值表
+// 批量扫描全部通道在滚动窗口 [tStart, tEnd] 内的 [Min, Max] 包络，每完成一通道立即回调 visit(ch)（0 allocs/op）。
+func (m *MultiRingBuffer) ScanWindowMinMax(
+	tStart, tEnd float64,
+	buckets int,
+	spanSlot0, spanLen []int32,
+	dstMin, dstMax []float32,
+	dstValid []byte,
+	visit func(ch int),
+) {
+	if buckets <= 0 || len(spanSlot0) < buckets || len(spanLen) < buckets ||
+		len(dstMin) < buckets || len(dstMax) < buckets || len(dstValid) < buckets || visit == nil {
+		return
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	sSlot0 := spanSlot0[:buckets]
+	sLen := spanLen[:buckets]
+	clear(sLen)
+	if m.count > 0 && tEnd > tStart {
+		buildRingWindowSpansNoClear(m.capPerCh, m.head, m.count, m.total, m.t0Base, m.dt, tStart, tEnd, buckets, sSlot0, sLen)
+	}
+	m.scanAllChannelsBySpans(buckets, sSlot0, sLen, dstMin[:buckets], dstMax[:buckets], dstValid[:buckets], visit)
+}
+
+// ScanSweepMinMax 在单次读锁内预计算一次擦除扫描模式像素桶跨度表，并批量扫描全部通道的 [Min, Max] 包络（0 allocs/op）。
+func (m *MultiRingBuffer) ScanSweepMinMax(
+	windowSec, eraseGapSec float64,
+	buckets int,
+	spanSlot0, spanLen []int32,
+	dstMin, dstMax []float32,
+	dstValid []byte,
+	visit func(ch int),
+) (cursorNorm float64) {
+	if buckets <= 0 || len(spanSlot0) < buckets || len(spanLen) < buckets ||
+		len(dstMin) < buckets || len(dstMax) < buckets || len(dstValid) < buckets || windowSec <= 0 || visit == nil {
+		return 0
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	sSlot0 := spanSlot0[:buckets]
+	sLen := spanLen[:buckets]
+	clear(sLen)
+	if m.count > 0 {
+		tNow := m.t0Base + float64(m.total-1)*m.dt
+		relNow := tNow - m.t0Base
+		cycleIdx := math.Floor(relNow / windowSec)
+		cycleStart := m.t0Base + cycleIdx*windowSec
+		cursorPhase := relNow - cycleIdx*windowSec
+		cursorNorm = min(max(cursorPhase/windowSec, 0), 1)
+
+		newBuckets := int(math.Floor(cursorNorm * float64(buckets)))
+		if newBuckets > 0 {
+			tSegEnd := cycleStart + float64(newBuckets)/float64(buckets)*windowSec
+			buildRingWindowSpansNoClear(m.capPerCh, m.head, m.count, m.total, m.t0Base, m.dt, cycleStart, tSegEnd, newBuckets, sSlot0[:newBuckets], sLen[:newBuckets])
+		} else {
+			buildRingWindowSpansNoClear(m.capPerCh, m.head, m.count, m.total, m.t0Base, m.dt, cycleStart, cycleStart+windowSec/float64(buckets), 1, sSlot0[:1], sLen[:1])
+		}
+		gapFrac := max(eraseGapSec/windowSec, 0)
+		oldStart := int(math.Ceil((cursorNorm + gapFrac) * float64(buckets)))
+		if oldStart < buckets {
+			oldB := buckets - oldStart
+			prevStart := cycleStart - windowSec
+			tOld0 := prevStart + float64(oldStart)/float64(buckets)*windowSec
+			tOld1 := prevStart + windowSec
+			buildRingWindowSpansNoClear(m.capPerCh, m.head, m.count, m.total, m.t0Base, m.dt, tOld0, tOld1, oldB, sSlot0[oldStart:buckets], sLen[oldStart:buckets])
+		}
+	}
+	m.scanAllChannelsBySpans(buckets, sSlot0, sLen, dstMin[:buckets], dstMax[:buckets], dstValid[:buckets], visit)
+	return cursorNorm
+}
+
+func buildRingWindowSpansNoClear(capSize, head, count int, total int64, t0Base, dt, tStart, tEnd float64, buckets int, spanSlot0, spanLen []int32) {
+	if count == 0 || buckets <= 0 || tEnd <= tStart {
+		return
+	}
+	firstAbs := total - int64(count)
+	lastAbs := total - 1
+	reqStart := int64(math.Ceil((tStart - t0Base) / dt))
+	reqEnd := int64(math.Floor((tEnd - t0Base) / dt))
+	startAbs := max(firstAbs, reqStart)
+	endAbs := min(lastAbs, reqEnd)
+	if startAbs > endAbs {
+		return
+	}
+	oldestSlot := (head - count + capSize) % capSize
+
+	if endAbs-startAbs+1 >= int64(buckets) {
+		offStart := (tStart - t0Base) / dt
+		stepIdx := ((tEnd - tStart) / float64(buckets)) / dt
+		s0 := max(firstAbs, int64(math.Ceil(offStart)))
+		for b := range buckets {
+			var s1 int64
+			if b == buckets-1 {
+				s1 = endAbs
+			} else {
+				s1 = min(lastAbs, int64(math.Ceil(offStart+float64(b+1)*stepIdx))-1)
+			}
+			if s0 <= s1 {
+				spanSlot0[b] = int32((oldestSlot + int(s0-firstAbs)) % capSize)
+				spanLen[b] = int32(s1 - s0 + 1)
+			}
+			s0 = max(firstAbs, s1+1)
+		}
+		return
+	}
+
+	scale := float64(buckets) / (tEnd - tStart)
+	for absIdx := startAbs; absIdx <= endAbs; absIdx++ {
+		b := int(((t0Base - tStart) + float64(absIdx)*dt) * scale)
+		if b < 0 {
+			continue
+		}
+		if b >= buckets {
+			b = buckets - 1
+		}
+		if spanLen[b] == 0 {
+			spanSlot0[b] = int32((oldestSlot + int(absIdx-firstAbs)) % capSize)
+			spanLen[b] = 1
+		} else {
+			spanLen[b]++
+		}
+	}
+}
+
+func (m *MultiRingBuffer) scanAllChannelsBySpans(
+	buckets int,
+	spanSlot0, spanLen []int32,
+	dstMin, dstMax []float32,
+	dstValid []byte,
+	visit func(ch int),
+) {
+	capCh := m.capPerCh
+	nBlk := m.nBlk
+	sSlot0 := spanSlot0[:buckets]
+	sLen := spanLen[:buckets]
+	dMin := dstMin[:buckets]
+	dMax := dstMax[:buckets]
+	dVal := dstValid[:buckets]
+
+	for ch := range m.channels {
+		chOrd := m.ord32[ch*capCh : (ch+1)*capCh]
+		chBMin := m.blkMin[ch*nBlk : (ch+1)*nBlk]
+		chBMax := m.blkMax[ch*nBlk : (ch+1)*nBlk]
+
+		if m.nonFiniteCnt[ch] == 0 {
+			for b := range buckets {
+				n := int(sLen[b])
+				if n <= 0 {
+					dVal[b] = 0
+					continue
+				}
+				slot0 := int(sSlot0[b])
+				var mnK, mxK int32
+				if slot0+n <= capCh {
+					if n < ringBlkSize*2 {
+						// 内联高频快路径（如 1kHz x 10s -> 1000 桶，n=10）：零函数调用开销 + 纯 CMOV 无分支聚合
+						seg := chOrd[slot0 : slot0+n]
+						mn0, mx0 := seg[0], seg[0]
+						if n > 1 {
+							mn1, mx1 := seg[1], seg[1]
+							i := 2
+							for ; i+3 < n; i += 4 {
+								s := seg[i : i+4 : i+4]
+								mn0 = min(mn0, min(s[0], s[2]))
+								mx0 = max(mx0, max(s[0], s[2]))
+								mn1 = min(mn1, min(s[1], s[3]))
+								mx1 = max(mx1, max(s[1], s[3]))
+							}
+							mn0 = min(mn0, mn1)
+							mx0 = max(mx0, mx1)
+							for ; i < n; i++ {
+								v := seg[i]
+								mn0 = min(mn0, v)
+								mx0 = max(mx0, v)
+							}
+						}
+						mnK, mxK = mn0, mx0
+					} else {
+						mnK, mxK = scanWideOrd32Clean(chOrd, chBMin, chBMax, slot0, slot0+n)
+					}
+				} else {
+					mn1, mx1 := scanContigOrd32Clean(chOrd, chBMin, chBMax, slot0, capCh)
+					mn2, mx2 := scanContigOrd32Clean(chOrd, chBMin, chBMax, 0, slot0+n-capCh)
+					mnK = min(mn1, mn2)
+					mxK = max(mx1, mx2)
+				}
+				bMin := uint32(mnK ^ int32(uint32(mnK>>31)>>1))
+				bMax := uint32(mxK ^ int32(uint32(mxK>>31)>>1))
+				dMin[b] = math.Float32frombits(bMin)
+				dMax[b] = math.Float32frombits(bMax)
+				dVal[b] = 1
+			}
+		} else {
+			for b := range buckets {
+				n := int(sLen[b])
+				if n <= 0 {
+					dVal[b] = 0
+					continue
+				}
+				slot0 := int(sSlot0[b])
+				var mnK, mxK int32
+				var ok bool
+				if slot0+n <= capCh {
+					mnK, mxK, ok = scanContigOrd32WithNaN(chOrd, chBMin, chBMax, slot0, slot0+n)
+				} else {
+					mn1, mx1, ok1 := scanContigOrd32WithNaN(chOrd, chBMin, chBMax, slot0, capCh)
+					mn2, mx2, ok2 := scanContigOrd32WithNaN(chOrd, chBMin, chBMax, 0, slot0+n-capCh)
+					if ok1 && ok2 {
+						mnK, mxK, ok = min(mn1, mn2), max(mx1, mx2), true
+					} else if ok1 {
+						mnK, mxK, ok = mn1, mx1, true
+					} else if ok2 {
+						mnK, mxK, ok = mn2, mx2, true
+					}
+				}
+				if ok {
+					dMin[b] = ord32ToFloat32(mnK)
+					dMax[b] = ord32ToFloat32(mxK)
+					dVal[b] = 1
+				} else {
+					dVal[b] = 0
+				}
+			}
+		}
+		visit(ch)
+	}
+}
+
+// scanWideOrd32Clean 利用 B=8 分块极值表扫描跨度 >= 16 的连续区间，减少 87.5% 内存读取。
+func scanWideOrd32Clean(chOrd, chBMin, chBMax []int32, slot0, slotEnd int) (mn, mx int32) {
+	b0 := (slot0 + ringBlkSize - 1) >> ringBlkShift
+	b1 := slotEnd >> ringBlkShift
+	mn = chBMin[b0]
+	mx = chBMax[b0]
+	for blk := b0 + 1; blk < b1; blk++ {
+		mn = min(mn, chBMin[blk])
+		mx = max(mx, chBMax[blk])
+	}
+	headEnd := b0 << ringBlkShift
+	for s := slot0; s < headEnd; s++ {
+		v := chOrd[s]
+		mn = min(mn, v)
+		mx = max(mx, v)
+	}
+	for s := b1 << ringBlkShift; s < slotEnd; s++ {
+		v := chOrd[s]
+		mn = min(mn, v)
+		mx = max(mx, v)
+	}
+	return mn, mx
+}
+
+// scanContigOrd32Clean 扫描无 NaN/Inf 的连续保序 int32 区间 [slot0, slotEnd)（环形回绕边界辅助）。
+func scanContigOrd32Clean(chOrd, chBMin, chBMax []int32, slot0, slotEnd int) (mn, mx int32) {
+	n := slotEnd - slot0
+	if n < ringBlkSize*2 {
+		seg := chOrd[slot0:slotEnd]
+		mn, mx = seg[0], seg[0]
+		for i := 1; i < n; i++ {
+			v := seg[i]
+			mn = min(mn, v)
+			mx = max(mx, v)
+		}
+		return mn, mx
+	}
+	return scanWideOrd32Clean(chOrd, chBMin, chBMax, slot0, slotEnd)
+}
+
+func scanContigOrd32WithNaN(chOrd, chBMin, chBMax []int32, slot0, slotEnd int) (mn, mx int32, ok bool) {
+	mn = math.MaxInt32
+	mx = ord32Invalid
+	n := slotEnd - slot0
+	if n < ringBlkSize*2 {
+		for _, k := range chOrd[slot0:slotEnd] {
+			if k != ord32Invalid {
+				mn = min(mn, k)
+				mx = max(mx, k)
+				ok = true
+			}
+		}
+		return mn, mx, ok
+	}
+
+	b0 := (slot0 + ringBlkSize - 1) >> ringBlkShift
+	b1 := slotEnd >> ringBlkShift
+	for blk := b0; blk < b1; blk++ {
+		bmn := chBMin[blk]
+		if bmn != ord32Invalid {
+			mn = min(mn, bmn)
+			mx = max(mx, chBMax[blk])
+			ok = true
+		}
+	}
+	headEnd := b0 << ringBlkShift
+	for s := slot0; s < headEnd; s++ {
+		k := chOrd[s]
+		if k != ord32Invalid {
+			mn = min(mn, k)
+			mx = max(mx, k)
+			ok = true
+		}
+	}
+	for s := b1 << ringBlkShift; s < slotEnd; s++ {
+		k := chOrd[s]
+		if k != ord32Invalid {
+			mn = min(mn, k)
+			mx = max(mx, k)
+			ok = true
+		}
+	}
+	return mn, mx, ok
+}
+
 // decimateRingSlice 在已加读锁的环形切片上执行 O(N_visible) 零分配像素桶包络聚合。
 func decimateRingSlice(buf []float64, capSize, head, count int, total int64, t0Base, dt, tStart, tEnd float64, buckets int, dst []MinMax) int {
 	clear(dst)
@@ -569,7 +1107,6 @@ func decimateRingSliceNoClear(buf []float64, capSize, head, count int, total int
 	firstAbs := total - int64(count)
 	lastAbs := total - 1
 
-	// 包含窗口两侧各外扩 1 个采样点确保边缘连线不断裂，这里精确限制在窗口时间桶内
 	reqStart := int64(math.Ceil((tStart - t0Base) / dt))
 	reqEnd := int64(math.Floor((tEnd - t0Base) / dt))
 	startAbs := max(firstAbs, reqStart)
@@ -579,9 +1116,82 @@ func decimateRingSliceNoClear(buf []float64, capSize, head, count int, total int
 	}
 
 	oldestSlot := (head - count + capSize) % capSize
+
+	// 高密度快路径（每像素桶 >= 2 个样本）：消除逐样本时间戳乘法与环形取模分支，直接复用无分支 CMOVQ scanBucketM4 内核
+	if endAbs-startAbs+1 >= int64(buckets)*2 {
+		offStart := (tStart - t0Base) / dt
+		stepIdx := ((tEnd - tStart) / float64(buckets)) / dt
+		validCount := 0
+		s0 := max(firstAbs, int64(math.Ceil(offStart)))
+		for b := range buckets {
+			var s1 int64
+			if b == buckets-1 {
+				s1 = endAbs
+			} else {
+				s1 = min(lastAbs, int64(math.Ceil(offStart+float64(b+1)*stepIdx))-1)
+			}
+			if s0 <= s1 {
+				n := int(s1 - s0 + 1)
+				slot0 := (oldestSlot + int(s0-firstAbs)) % capSize
+				if slot0+n <= capSize {
+					fIdx, minIdx, maxIdx, _, fVal, minVal, maxVal, lVal, _ := scanBucketM4(buf[slot0:slot0+n], 0)
+					if fIdx >= 0 {
+						dst[b] = MinMax{
+							First:    float32(fVal),
+							Min:      float32(minVal),
+							Max:      float32(maxVal),
+							Last:     float32(lVal),
+							MinFirst: minIdx <= maxIdx,
+							Valid:    true,
+						}
+						validCount++
+					}
+				} else {
+					n1 := capSize - slot0
+					f1, mn1, mx1, _, fv1, mnv1, mxv1, lv1, _ := scanBucketM4(buf[slot0:capSize], 0)
+					f2, mn2, mx2, _, fv2, mnv2, mxv2, lv2, _ := scanBucketM4(buf[:n-n1], n1)
+					if f1 >= 0 && f2 >= 0 {
+						minIdx, minVal := mn1, mnv1
+						if mnv2 < minVal {
+							minVal = mnv2
+							minIdx = mn2
+						}
+						maxIdx, maxVal := mx1, mxv1
+						if mxv2 > maxVal {
+							maxVal = mxv2
+							maxIdx = mx2
+						}
+						dst[b] = MinMax{
+							First:    float32(fv1),
+							Min:      float32(minVal),
+							Max:      float32(maxVal),
+							Last:     float32(lv2),
+							MinFirst: minIdx <= maxIdx,
+							Valid:    true,
+						}
+						validCount++
+					} else if f1 >= 0 {
+						dst[b] = MinMax{
+							First: float32(fv1), Min: float32(mnv1), Max: float32(mxv1), Last: float32(lv1),
+							MinFirst: mn1 <= mx1, Valid: true,
+						}
+						validCount++
+					} else if f2 >= 0 {
+						dst[b] = MinMax{
+							First: float32(fv2), Min: float32(mnv2), Max: float32(mxv2), Last: float32(lv2),
+							MinFirst: mn2 <= mx2, Valid: true,
+						}
+						validCount++
+					}
+				}
+			}
+			s0 = max(firstAbs, s1+1)
+		}
+		return validCount
+	}
+
 	scale := float64(buckets) / (tEnd - tStart)
 	validCount := 0
-
 	slot := (oldestSlot + int(startAbs-firstAbs)) % capSize
 	for absIdx := startAbs; absIdx <= endAbs; absIdx++ {
 		y := buf[slot]
@@ -592,8 +1202,8 @@ func decimateRingSliceNoClear(buf []float64, capSize, head, count int, total int
 		if !isFinite(y) {
 			continue
 		}
-		t := t0Base + float64(absIdx)*dt
-		b := int((t - tStart) * scale)
+		t := (t0Base - tStart) + float64(absIdx)*dt
+		b := int(t * scale)
 		if b < 0 {
 			continue
 		}

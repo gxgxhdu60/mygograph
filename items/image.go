@@ -471,11 +471,13 @@ func (wf *WaterfallItem) ArmWake() {
 	wf.wakeArmed.Store(true)
 }
 
-// StreamSeq 实现 mygograph.StreamItem，供 Plot 检测活跃推流并在流暂停后自动降为 0% 空闲 CPU。
-func (wf *WaterfallItem) StreamSeq() uint64 {
+// StreamVersion 实现 mygograph.StreamItem，供 Plot 检测活跃推流并在流暂停后自动降为 0% 空闲 CPU。
+func (wf *WaterfallItem) StreamVersion() (uint64, bool) {
 	wf.ArmWake()
-	return wf.seq.Load()
+	return wf.seq.Load(), true
 }
+
+var _ mygograph.StreamItem = (*WaterfallItem)(nil)
 
 // PushRow 线程安全地向瀑布图环形缓冲推入最新一行频谱/扫描帧（仅执行单行 O(cols) 16-bit 打包，零整图拷贝）。
 func (wf *WaterfallItem) PushRow(row []float64) {
