@@ -370,78 +370,24 @@ func (mc *MultiChannelItem) PrepareShaderFrame(tStart, tEnd float64, buckets int
 	nCh := mc.ring.Channels()
 	mc.ensureBuffers(nCh, buckets, th)
 
-	sweepCursorNorm = -1
 	normScale := float32(mc.gain / (max(mc.lanePeakToPeak, 1e-30) * defaultMaxLaneAmp))
 	quantMul := normScale * 32767.0
-	stride := mc.envRGBA.Stride
-	pix := mc.envRGBA.Pix
-	minArr := mc.minScratch[:buckets]
-	maxArr := mc.maxScratch[:buckets]
-	valArr := mc.validScratch[:buckets]
-	doDC := mc.dcRemoval
 
-	// 单次读锁 + 共享桶跨度预计算 + 逐通道 L1 驻留流水线编码（全程 0 allocs/op）
-	encodeChannel := func(ch int) {
-		var dcMean float32
-		if doDC {
-			var sum float32
-			var cnt int
-			for b := range buckets {
-				if valArr[b] != 0 {
-					sum += minArr[b] + maxArr[b]
-					cnt++
-				}
-			}
-			if cnt > 0 {
-				dcMean = sum / float32(cnt*2)
-			}
-		}
-
-		bias := float32(32768.5) - dcMean*quantMul
-		rowMinPix := pix[(2*ch)*stride : (2*ch)*stride+buckets*4]
-		rowMaxPix := pix[(2*ch+1)*stride : (2*ch+1)*stride+buckets*4]
-
-		for b := range buckets {
-			off := b * 4
-			pMin := rowMinPix[off : off+4 : off+4]
-			pMax := rowMaxPix[off : off+4 : off+4]
-			if valArr[b] == 0 {
-				pMin[0], pMin[1], pMin[2], pMin[3] = 0, 0, 0, 255
-				pMax[0], pMax[1], pMax[2], pMax[3] = 0, 0, 0, 255
-				continue
-			}
-			qfLo := minArr[b]*quantMul + bias
-			if qfLo < 1.5 {
-				qfLo = 1.5
-			} else if qfLo > 65535.5 {
-				qfLo = 65535.5
-			}
-			qLo := uint16(qfLo)
-			pMin[0] = uint8(qLo >> 8)
-			pMin[1] = uint8(qLo)
-			pMin[2] = 255
-			pMin[3] = 255
-
-			qfHi := maxArr[b]*quantMul + bias
-			if qfHi < 1.5 {
-				qfHi = 1.5
-			} else if qfHi > 65535.5 {
-				qfHi = 65535.5
-			}
-			qHi := uint16(qfHi)
-			pMax[0] = uint8(qHi >> 8)
-			pMax[1] = uint8(qHi)
-			pMax[2] = 255
-			pMax[3] = 255
-		}
-	}
-
-	if mc.mode == DisplaySweepMode {
-		sweepCursorNorm = mc.ring.ScanSweepMinMax(mc.windowSec, mc.eraseGapSec, buckets, mc.spanSlot0, mc.spanLen, minArr, maxArr, valArr, encodeChannel)
-	} else {
-		mc.ring.ScanWindowMinMax(tStart, tEnd, buckets, mc.spanSlot0, mc.spanLen, minArr, maxArr, valArr, encodeChannel)
-	}
-	return sweepCursorNorm
+	return mc.ring.PackShaderEnvelope(
+		tStart, tEnd,
+		mc.mode == DisplaySweepMode,
+		mc.windowSec, mc.eraseGapSec,
+		buckets,
+		mc.dcRemoval,
+		quantMul,
+		mc.envRGBA.Pix,
+		mc.envRGBA.Stride,
+		mc.spanSlot0[:buckets],
+		mc.spanLen[:buckets],
+		mc.minScratch[:buckets],
+		mc.maxScratch[:buckets],
+		mc.validScratch[:buckets],
+	)
 }
 
 func (mc *MultiChannelItem) Draw(rc *mygograph.RenderContext) {

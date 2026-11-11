@@ -284,10 +284,14 @@ func (im *ImageItem) Bounds() (xRange, yRange data.Range, ok bool) {
 	return data.Range{Min: im.x0, Max: im.x1}, data.Range{Min: im.y0, Max: im.y1}, true
 }
 
-// SnapNearest 实现十字光标悬停二维标量场精确单元读数（返回 Z 标量格式化信息）。
-func (im *ImageItem) SnapNearest(queryX, queryY float64, vt data.ViewportTransform) (snapX, snapY float64, label string, ok bool) {
-	if im.cols <= 0 || im.rows <= 0 || queryX < im.x0 || queryX > im.x1 || queryY < im.y0 || queryY > im.y1 {
-		return 0, 0, "", false
+// SnapNearest 实现 mygograph.SnapTarget，支持十字光标悬停二维标量场精确单元读数（返回 Z 标量格式化信息）。
+func (im *ImageItem) SnapNearest(lx, ly float32, plotRect ui.Rect, vb *mygograph.ViewBox) (mygograph.SnapPoint, bool) {
+	if im.cols <= 0 || im.rows <= 0 || vb == nil {
+		return mygograph.SnapPoint{}, false
+	}
+	queryX, queryY := vb.LocalToData(lx, ly, plotRect.W, plotRect.H)
+	if queryX < im.x0 || queryX > im.x1 || queryY < im.y0 || queryY > im.y1 {
+		return mygograph.SnapPoint{}, false
 	}
 	u := (queryX - im.x0) / max(im.x1-im.x0, 1e-30)
 	v := (queryY - im.y0) / max(im.y1-im.y0, 1e-30)
@@ -298,7 +302,7 @@ func (im *ImageItem) SnapNearest(queryX, queryY float64, vt data.ViewportTransfo
 	row := min(max(int(math.Floor(v*float64(im.rows))), 0), im.rows-1)
 	val, valid := im.CellValue(col, row)
 	if !valid {
-		return 0, 0, "", false
+		return mygograph.SnapPoint{}, false
 	}
 	_, unit := im.ctrl.LabelAndUnit()
 	zText := mygograph.FormatSIValue(val, 4, unit)
@@ -306,8 +310,16 @@ func (im *ImageItem) SnapNearest(queryX, queryY float64, vt data.ViewportTransfo
 	if prefix == "" {
 		prefix = "Z"
 	}
-	return queryX, queryY, fmt.Sprintf("%s=%s [%d,%d]", prefix, zText, col, row), true
+	return mygograph.SnapPoint{
+		DataX:   queryX,
+		DataY:   queryY,
+		ScreenX: plotRect.X + lx,
+		ScreenY: plotRect.Y + ly,
+		Label:   fmt.Sprintf("%s=%s [%d,%d]", prefix, zText, col, row),
+	}, true
 }
+
+var _ mygograph.SnapTarget = (*ImageItem)(nil)
 
 func (im *ImageItem) Draw(rc *mygograph.RenderContext) {
 	if !im.visible || im.cols <= 0 || im.rows <= 0 || im.rgba == nil {
@@ -550,37 +562,55 @@ func (wf *WaterfallItem) WriteRow() int {
 	return wf.writeRow
 }
 
-// SnapNearest 支持十字光标在瀑布图任意历史时刻与频率点上读取精确功率值。
-func (wf *WaterfallItem) SnapNearest(queryX, queryY float64, vt data.ViewportTransform) (snapX, snapY float64, label string, ok bool) {
+// SnapNearest 实现 mygograph.SnapTarget，支持十字光标在瀑布图任意历史时刻与频率点上读取精确功率值。
+func (wf *WaterfallItem) SnapNearest(lx, ly float32, plotRect ui.Rect, vb *mygograph.ViewBox) (mygograph.SnapPoint, bool) {
+	if vb == nil {
+		return mygograph.SnapPoint{}, false
+	}
+	queryX, queryY := vb.LocalToData(lx, ly, plotRect.W, plotRect.H)
+
 	wf.mu.Lock()
 	defer wf.mu.Unlock()
 	if queryX < wf.x0 || queryX > wf.x1 || queryY < wf.y0 || queryY > wf.y1 {
-		return 0, 0, "", false
+		return mygograph.SnapPoint{}, false
 	}
 	u := (queryX - wf.x0) / max(wf.x1-wf.x0, 1e-30)
-	vPhys := (queryY - wf.y0) / max(wf.y1-wf.y0, 1e-30) // 0 对应 y0（底），1 对应 y1（顶）
+	spanY := max(wf.y1-wf.y0, 1e-30)
+	var vFromTop float64
+	if vb.InvertY() {
+		vFromTop = (queryY - wf.y0) / spanY
+	} else {
+		vFromTop = (wf.y1 - queryY) / spanY
+	}
 	// 在纹理环形空间中：行 (writeRow + k) % rows 按 k=0..rows-1 从最旧排到最新
 	var ageFrac float64
 	if wf.newestAtTop {
-		// 顶部 y1 (vPhys=1) 为最新 (ageFrac -> 1)，底部 y0 (vPhys=0) 为最旧 (ageFrac -> 0)
-		ageFrac = vPhys
+		ageFrac = 1.0 - vFromTop
 	} else {
-		ageFrac = 1.0 - vPhys
+		ageFrac = vFromTop
 	}
 	col := min(max(int(math.Floor(u*float64(wf.cols))), 0), wf.cols-1)
 	ageIdx := min(max(int(math.Floor(ageFrac*float64(wf.rows))), 0), wf.rows-1)
 	ringRow := (wf.writeRow + ageIdx) % wf.rows
 	val := wf.raw[ringRow*wf.cols+col]
 	if math.IsNaN(val) || math.IsInf(val, 0) {
-		return 0, 0, "", false
+		return mygograph.SnapPoint{}, false
 	}
 	_, unit := wf.ctrl.LabelAndUnit()
 	prefix := wf.name
 	if prefix == "" {
 		prefix = "W"
 	}
-	return queryX, queryY, fmt.Sprintf("%s=%s", prefix, mygograph.FormatSIValue(val, 4, unit)), true
+	return mygograph.SnapPoint{
+		DataX:   queryX,
+		DataY:   queryY,
+		ScreenX: plotRect.X + lx,
+		ScreenY: plotRect.Y + ly,
+		Label:   fmt.Sprintf("%s=%s", prefix, mygograph.FormatSIValue(val, 4, unit)),
+	}, true
 }
+
+var _ mygograph.SnapTarget = (*WaterfallItem)(nil)
 
 func (wf *WaterfallItem) Draw(rc *mygograph.RenderContext) {
 	if !wf.visible {
@@ -610,11 +640,10 @@ func (wf *WaterfallItem) Draw(rc *mygograph.RenderContext) {
 	wf.mu.Unlock()
 
 	flags := shaders.LUT16FlagCyclicY
-	// 环形纹理中 uv=0(+RowOffset) 对应最旧帧，uv=1(-eps+RowOffset) 对应最新帧。
-	// 若最新帧显示在屏幕顶部（pos.y=0 -> uv.y=0），则需开启 FlipY 将 uv.y 翻转为 1.0-uv.y 后再叠加 RowOffset！
-	screenTopIsY1 := !rc.View.InvertY()
-	topNeedsNewest := (newestTop && screenTopIsY1) || (!newestTop && !screenTopIsY1)
-	if topNeedsNewest {
+	// computeClippedImageUV 始终将屏幕上边缘映射为 uv.y=0、屏幕下边缘映射为 uv.y=1；
+	// 环形纹理中 uv=0(+RowOffset) 为最旧帧，uv=1(-eps+RowOffset) 为最新帧。
+	// 因此当 newestAtTop=true 时始终翻转 uv.y，使最新谱线稳定位于屏幕顶部并向下滚动。
+	if newestTop {
 		flags |= shaders.LUT16FlagFlipY
 	}
 	if smooth {

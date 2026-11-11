@@ -126,10 +126,12 @@ func TestWaterfallSingleDrawCallRingWrapAndSnap(t *testing.T) {
 		t.Fatalf("bottom (oldest=30) waterfall row should be ~76 gray, got %v", botColor)
 	}
 
-	// 验证 SnapNearest 精确命中环形索引
-	_, _, lbl, ok := wf.SnapNearest(200, 3.5, vt)
-	if !ok || lbl == "" {
-		t.Fatalf("Waterfall SnapNearest failed: ok=%v lbl=%q", ok, lbl)
+	// 验证 SnapNearest（实现 mygograph.SnapTarget）精确命中环形索引
+	lx := float32(cx) - pr.X
+	ly := vt.DataToScreenY(3.5) - pr.Y
+	pt, ok := wf.SnapNearest(lx, ly, pr, plot.ViewBox())
+	if !ok || pt.Label == "" {
+		t.Fatalf("Waterfall SnapNearest failed: ok=%v lbl=%q", ok, pt.Label)
 	}
 }
 

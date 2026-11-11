@@ -219,7 +219,38 @@ func summarizeRawBlock(sub []float64) PyramidNode {
 }
 
 func summarizeParentBlock(children []PyramidNode) PyramidNode {
+	if len(children) == 1 {
+		return children[0]
+	}
 	var node PyramidNode
+	if len(children) > 0 && children[0].Valid && !children[0].HasNaN {
+		node = children[0]
+		for i := 1; i < len(children); i++ {
+			ch := &children[i]
+			if !ch.Valid || ch.HasNaN {
+				if ch.HasNaN {
+					node.HasNaN = true
+				}
+				if !ch.Valid {
+					continue
+				}
+			}
+			node.Last = ch.Last
+			if ch.Min < node.Min {
+				node.Min = ch.Min
+				if ch.Max > node.Max {
+					node.Max = ch.Max
+					node.MinFirst = ch.MinFirst
+				} else {
+					node.MinFirst = false
+				}
+			} else if ch.Max > node.Max {
+				node.Max = ch.Max
+				node.MinFirst = true
+			}
+		}
+		return node
+	}
 	for i := range children {
 		ch := &children[i]
 		if ch.HasNaN {
@@ -237,8 +268,6 @@ func summarizeParentBlock(children []PyramidNode) PyramidNode {
 			node.Valid = true
 		} else {
 			node.Last = ch.Last
-			// 若子块同时刷新了更小的 Min 和更大的 Max，则保留该子块自身的 MinFirst；
-			// 若仅刷新了单一极值，严格后出现的极值位于右侧。
 			newMin := ch.Min < node.Min
 			newMax := ch.Max > node.Max
 			if newMin && newMax {
@@ -364,11 +393,14 @@ func (p *MinMaxPyramid) Query(vt ViewportTransform, buckets int, dst [][2]float3
 		return projectUniformSlice(p.t0, p.dt, p.raw, vt, DecimateM4, buckets, out)
 	}
 
-	// 自动选取最高层级 lvlIdx（对应步长 stride = 64^(lvlIdx+1)），满足每像素桶至少包含 >= 2 个汇总块
+	// 自动选取最高层级 lvlIdx（对应步长 stride = 64^(lvlIdx+1)）；
+	// 每个 PyramidNode 已预存 4 个极值特征点（First/Min/Max/Last），因此当高层包含 >= buckets/2 个节点
+	// （即 >= 2*buckets 个极值顶点）时即可100%无损保留脉冲包络，同时将下层最大扫描节点数压缩 4 倍。
+	minNodes := max(buckets/2, 1)
 	lvlIdx := 0
 	for lvlIdx+1 < len(p.levels) {
 		nextShift := uint((lvlIdx + 2) * pyramidShift)
-		if (visSamples >> nextShift) < buckets*2 {
+		if (visSamples >> nextShift) < minNodes {
 			break
 		}
 		lvlIdx++

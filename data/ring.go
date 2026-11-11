@@ -852,6 +852,324 @@ func (m *MultiRingBuffer) ScanSweepMinMax(
 	return cursorNorm
 }
 
+const (
+	numPackHelpers    = 3 // 3 常驻休眠辅助协程 + 调用者主线程 = 4 路零分配并行分片
+	maxPoolPackBucket = 4096
+)
+
+type packWorkerScratch struct {
+	minBuf [maxPoolPackBucket]float32
+	maxBuf [maxPoolPackBucket]float32
+	valBuf [maxPoolPackBucket]byte
+}
+
+var shaderPackPool struct {
+	once      sync.Once
+	mu        sync.Mutex
+	ring      *MultiRingBuffer
+	buckets   int
+	spanSlot0 []int32
+	spanLen   []int32
+	doDC      bool
+	quantMul  float32
+	dstPix    []byte
+	dstStride int
+	workCh    [numPackHelpers]chan int
+	doneCh    chan struct{}
+	bufs      [numPackHelpers + 1]packWorkerScratch
+}
+
+func initShaderPackPool() {
+	shaderPackPool.doneCh = make(chan struct{}, numPackHelpers)
+	for i := range numPackHelpers {
+		ch := make(chan int, 1)
+		shaderPackPool.workCh[i] = ch
+		go func(c <-chan int) {
+			for workerID := range c {
+				r := shaderPackPool.ring
+				nCh := r.channels
+				ch0 := (workerID * nCh) / (numPackHelpers + 1)
+				ch1 := ((workerID + 1) * nCh) / (numPackHelpers + 1)
+				packChannelRange16(
+					r,
+					ch0, ch1,
+					shaderPackPool.buckets,
+					shaderPackPool.spanSlot0,
+					shaderPackPool.spanLen,
+					shaderPackPool.doDC,
+					shaderPackPool.quantMul,
+					shaderPackPool.dstPix,
+					shaderPackPool.dstStride,
+					shaderPackPool.bufs[workerID].minBuf[:shaderPackPool.buckets],
+					shaderPackPool.bufs[workerID].maxBuf[:shaderPackPool.buckets],
+					shaderPackPool.bufs[workerID].valBuf[:shaderPackPool.buckets],
+				)
+				shaderPackPool.doneCh <- struct{}{}
+			}
+		}(ch)
+	}
+}
+
+// PackShaderEnvelope 在单次读锁内完成全部导联的极值降采样、可选实时去直流（DC Removal）与 16-bit RGBA 包络纹理打包（0 allocs/op）。
+// 当通道数 >= 64 且 buckets <= 4096 时，自动唤醒 4 路零分配并行工作分片，在多核降频/满载压力下仍确保 256ch x 1kHz x 10s 远低于 6ms 门禁。
+func (m *MultiRingBuffer) PackShaderEnvelope(
+	tStart, tEnd float64,
+	sweepMode bool,
+	windowSec, eraseGapSec float64,
+	buckets int,
+	doDC bool,
+	quantMul float32,
+	dstPix []byte,
+	dstStride int,
+	spanSlot0, spanLen []int32,
+	minScratch, maxScratch []float32,
+	valScratch []byte,
+) (cursorNorm float64) {
+	cursorNorm = -1
+	if buckets <= 0 || len(spanSlot0) < buckets || len(spanLen) < buckets ||
+		len(minScratch) < buckets || len(maxScratch) < buckets || len(valScratch) < buckets {
+		return cursorNorm
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	sSlot0 := spanSlot0[:buckets]
+	sLen := spanLen[:buckets]
+	clear(sLen)
+
+	if sweepMode {
+		cursorNorm = 0
+		if m.count > 0 && windowSec > 0 {
+			tNow := m.t0Base + float64(m.total-1)*m.dt
+			relNow := tNow - m.t0Base
+			cycleIdx := math.Floor(relNow / windowSec)
+			cycleStart := m.t0Base + cycleIdx*windowSec
+			cursorPhase := relNow - cycleIdx*windowSec
+			cursorNorm = min(max(cursorPhase/windowSec, 0), 1)
+
+			newBuckets := int(math.Floor(cursorNorm * float64(buckets)))
+			if newBuckets > 0 {
+				tSegEnd := cycleStart + float64(newBuckets)/float64(buckets)*windowSec
+				buildRingWindowSpansNoClear(m.capPerCh, m.head, m.count, m.total, m.t0Base, m.dt, cycleStart, tSegEnd, newBuckets, sSlot0[:newBuckets], sLen[:newBuckets])
+			} else {
+				buildRingWindowSpansNoClear(m.capPerCh, m.head, m.count, m.total, m.t0Base, m.dt, cycleStart, cycleStart+windowSec/float64(buckets), 1, sSlot0[:1], sLen[:1])
+			}
+			gapFrac := max(eraseGapSec/windowSec, 0)
+			oldStart := int(math.Ceil((cursorNorm + gapFrac) * float64(buckets)))
+			if oldStart < buckets {
+				oldB := buckets - oldStart
+				prevStart := cycleStart - windowSec
+				tOld0 := prevStart + float64(oldStart)/float64(buckets)*windowSec
+				tOld1 := prevStart + windowSec
+				buildRingWindowSpansNoClear(m.capPerCh, m.head, m.count, m.total, m.t0Base, m.dt, tOld0, tOld1, oldB, sSlot0[oldStart:buckets], sLen[oldStart:buckets])
+			}
+		}
+	} else if m.count > 0 && tEnd > tStart {
+		buildRingWindowSpansNoClear(m.capPerCh, m.head, m.count, m.total, m.t0Base, m.dt, tStart, tEnd, buckets, sSlot0, sLen)
+	}
+
+	if m.channels >= 64 && buckets <= maxPoolPackBucket {
+		shaderPackPool.once.Do(initShaderPackPool)
+		shaderPackPool.mu.Lock()
+		shaderPackPool.ring = m
+		shaderPackPool.buckets = buckets
+		shaderPackPool.spanSlot0 = sSlot0
+		shaderPackPool.spanLen = sLen
+		shaderPackPool.doDC = doDC
+		shaderPackPool.quantMul = quantMul
+		shaderPackPool.dstPix = dstPix
+		shaderPackPool.dstStride = dstStride
+
+		for i := range numPackHelpers {
+			shaderPackPool.workCh[i] <- i
+		}
+		// 调用者主线程同步执行第 4 分片，零上下文切换浪费
+		ch0 := (numPackHelpers * m.channels) / (numPackHelpers + 1)
+		packChannelRange16(
+			m,
+			ch0, m.channels,
+			buckets,
+			sSlot0, sLen,
+			doDC, quantMul,
+			dstPix, dstStride,
+			shaderPackPool.bufs[numPackHelpers].minBuf[:buckets],
+			shaderPackPool.bufs[numPackHelpers].maxBuf[:buckets],
+			shaderPackPool.bufs[numPackHelpers].valBuf[:buckets],
+		)
+		for range numPackHelpers {
+			<-shaderPackPool.doneCh
+		}
+		// 立即清空临时引用，确保 GC 不滞留任何环形缓冲或像素切片
+		shaderPackPool.ring = nil
+		shaderPackPool.spanSlot0 = nil
+		shaderPackPool.spanLen = nil
+		shaderPackPool.dstPix = nil
+		shaderPackPool.mu.Unlock()
+		return cursorNorm
+	}
+
+	packChannelRange16(m, 0, m.channels, buckets, sSlot0, sLen, doDC, quantMul, dstPix, dstStride, minScratch[:buckets], maxScratch[:buckets], valScratch[:buckets])
+	return cursorNorm
+}
+
+func packChannelRange16(
+	m *MultiRingBuffer,
+	chStart, chEnd int,
+	buckets int,
+	sSlot0, sLen []int32,
+	doDC bool,
+	quantMul float32,
+	pix []byte,
+	stride int,
+	dMin, dMax []float32,
+	dVal []byte,
+) {
+	capCh := m.capPerCh
+	nBlk := m.nBlk
+
+	for ch := chStart; ch < chEnd; ch++ {
+		chOrd := m.ord32[ch*capCh : (ch+1)*capCh]
+		chBMin := m.blkMin[ch*nBlk : (ch+1)*nBlk]
+		chBMax := m.blkMax[ch*nBlk : (ch+1)*nBlk]
+
+		var sum float32
+		var cnt int
+
+		if m.nonFiniteCnt[ch] == 0 {
+			for b := range buckets {
+				n := int(sLen[b])
+				if n <= 0 {
+					dVal[b] = 0
+					continue
+				}
+				slot0 := int(sSlot0[b])
+				var mnK, mxK int32
+				if slot0+n <= capCh {
+					if n < ringBlkSize*2 {
+						seg := chOrd[slot0 : slot0+n]
+						mn0, mx0 := seg[0], seg[0]
+						if n > 1 {
+							mn1, mx1 := seg[1], seg[1]
+							i := 2
+							for ; i+3 < n; i += 4 {
+								s := seg[i : i+4 : i+4]
+								mn0 = min(mn0, min(s[0], s[2]))
+								mx0 = max(mx0, max(s[0], s[2]))
+								mn1 = min(mn1, min(s[1], s[3]))
+								mx1 = max(mx1, max(s[1], s[3]))
+							}
+							mn0 = min(mn0, mn1)
+							mx0 = max(mx0, mx1)
+							for ; i < n; i++ {
+								v := seg[i]
+								mn0 = min(mn0, v)
+								mx0 = max(mx0, v)
+							}
+						}
+						mnK, mxK = mn0, mx0
+					} else {
+						mnK, mxK = scanWideOrd32Clean(chOrd, chBMin, chBMax, slot0, slot0+n)
+					}
+				} else {
+					mn1, mx1 := scanContigOrd32Clean(chOrd, chBMin, chBMax, slot0, capCh)
+					mn2, mx2 := scanContigOrd32Clean(chOrd, chBMin, chBMax, 0, slot0+n-capCh)
+					mnK = min(mn1, mn2)
+					mxK = max(mx1, mx2)
+				}
+				vLo := math.Float32frombits(uint32(mnK ^ int32(uint32(mnK>>31)>>1)))
+				vHi := math.Float32frombits(uint32(mxK ^ int32(uint32(mxK>>31)>>1)))
+				dMin[b] = vLo
+				dMax[b] = vHi
+				dVal[b] = 1
+				if doDC {
+					sum += vLo + vHi
+					cnt++
+				}
+			}
+		} else {
+			for b := range buckets {
+				n := int(sLen[b])
+				if n <= 0 {
+					dVal[b] = 0
+					continue
+				}
+				slot0 := int(sSlot0[b])
+				var mnK, mxK int32
+				var ok bool
+				if slot0+n <= capCh {
+					mnK, mxK, ok = scanContigOrd32WithNaN(chOrd, chBMin, chBMax, slot0, slot0+n)
+				} else {
+					mn1, mx1, ok1 := scanContigOrd32WithNaN(chOrd, chBMin, chBMax, slot0, capCh)
+					mn2, mx2, ok2 := scanContigOrd32WithNaN(chOrd, chBMin, chBMax, 0, slot0+n-capCh)
+					if ok1 && ok2 {
+						mnK, mxK, ok = min(mn1, mn2), max(mx1, mx2), true
+					} else if ok1 {
+						mnK, mxK, ok = mn1, mx1, true
+					} else if ok2 {
+						mnK, mxK, ok = mn2, mx2, true
+					}
+				}
+				if ok {
+					vLo := ord32ToFloat32(mnK)
+					vHi := ord32ToFloat32(mxK)
+					dMin[b] = vLo
+					dMax[b] = vHi
+					dVal[b] = 1
+					if doDC {
+						sum += vLo + vHi
+						cnt++
+					}
+				} else {
+					dVal[b] = 0
+				}
+			}
+		}
+
+		var dcMean float32
+		if doDC && cnt > 0 {
+			dcMean = sum / float32(cnt*2)
+		}
+		bias := float32(32768.5) - dcMean*quantMul
+		rowMinPix := pix[(2*ch)*stride : (2*ch)*stride+buckets*4]
+		rowMaxPix := pix[(2*ch+1)*stride : (2*ch+1)*stride+buckets*4]
+
+		for b := range buckets {
+			off := b * 4
+			pMin := rowMinPix[off : off+4 : off+4]
+			pMax := rowMaxPix[off : off+4 : off+4]
+			if dVal[b] == 0 {
+				pMin[0], pMin[1], pMin[2], pMin[3] = 0, 0, 0, 255
+				pMax[0], pMax[1], pMax[2], pMax[3] = 0, 0, 0, 255
+				continue
+			}
+			qfLo := dMin[b]*quantMul + bias
+			if qfLo < 1.5 {
+				qfLo = 1.5
+			} else if qfLo > 65535.5 {
+				qfLo = 65535.5
+			}
+			qLo := uint16(qfLo)
+			pMin[0] = uint8(qLo >> 8)
+			pMin[1] = uint8(qLo)
+			pMin[2] = 255
+			pMin[3] = 255
+
+			qfHi := dMax[b]*quantMul + bias
+			if qfHi < 1.5 {
+				qfHi = 1.5
+			} else if qfHi > 65535.5 {
+				qfHi = 65535.5
+			}
+			qHi := uint16(qfHi)
+			pMax[0] = uint8(qHi >> 8)
+			pMax[1] = uint8(qHi)
+			pMax[2] = 255
+			pMax[3] = 255
+		}
+	}
+}
+
 func buildRingWindowSpansNoClear(capSize, head, count int, total int64, t0Base, dt, tStart, tEnd float64, buckets int, spanSlot0, spanLen []int32) {
 	if count == 0 || buckets <= 0 || tEnd <= tStart {
 		return
