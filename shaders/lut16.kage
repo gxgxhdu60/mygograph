@@ -1,0 +1,112 @@
+//go:build ignore
+
+package main
+
+// UVOffset 与 UVScale 将当前裁剪后的屏幕绘制矩形 pos/rectSize() 精确还原至全图归一化纹理坐标 [0, 1]^2。
+var UVOffset vec2
+var UVScale vec2
+
+// RowOffset 为环形瀑布图写指针归一化偏移（writeRow / Rows），静态 ImageItem 固定为 0。
+var RowOffset float
+
+// VMinNorm 与 InvSpanNorm 在 16-bit 归一化标量域 [0, 1] 内执行零 CPU 开销动态范围线性窗宽窗位映射：
+// mapped = clamp((valNorm - VMinNorm) * InvSpanNorm, 0.0, 1.0)。
+var VMinNorm float
+var InvSpanNorm float
+
+// Opacity 控制整体图层不透明度 [0, 1]。
+var Opacity float
+
+// Flags 位掩码：
+// bit 0 (1): FlipY（将纹理第 0 行映射至屏幕下方即物理 YMin 处）
+// bit 1 (2): Smooth（开启解码后 16-bit 标量双线性插值，消除高低字节进位锯齿）
+// bit 2 (4): CyclicY（开启环形瀑布图 Y 轴 fract 循环寻址）
+var Flags int
+
+func decode16(px vec4) (float, float) {
+	// B 通道承载 NaN 有效性掩码：B > 0.5 表示有效样本，B == 0 表示 NaN 透明空洞。
+	if px.b < 0.5 {
+		return 0.0, 0.0
+	}
+	hi := floor(px.r*255.0 + 0.5)
+	lo := floor(px.g*255.0 + 0.5)
+	return (hi*256.0 + lo) / 65535.0, 1.0
+}
+
+func Fragment(dst vec4, pos vec2) vec4 {
+	rs := rectSize()
+	if rs.x <= 0.0 || rs.y <= 0.0 {
+		return vec4(0.0)
+	}
+	uv := UVOffset + (pos/rs)*UVScale
+	if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 {
+		return vec4(0.0)
+	}
+
+	if (Flags & 1) != 0 {
+		uv.y = 1.0 - uv.y
+	}
+	if (Flags & 4) != 0 {
+		uv.y = fract(uv.y + RowOffset)
+	}
+
+	texSize := image0Size()
+	if texSize.x <= 0.0 || texSize.y <= 0.0 {
+		return vec4(0.0)
+	}
+
+	var valNorm float
+	var valid float
+
+	if (Flags & 2) == 0 {
+		// 科学像素级硬边模式（Pixelated）：严格定位对应数据网格单元中心
+		col := clamp(floor(uv.x*texSize.x), 0.0, texSize.x-1.0)
+		row := clamp(floor(uv.y*texSize.y), 0.0, texSize.y-1.0)
+		valNorm, valid = decode16(image0At(vec2(col+0.5, row+0.5)))
+	} else {
+		// 解码后 16-bit 标量域双线性插值（避免直接对高低字节纹理做硬件插值产生进位伪影）
+		gx := uv.x*texSize.x - 0.5
+		gy := uv.y*texSize.y - 0.5
+		x0 := floor(gx)
+		fx := gx - x0
+		x1 := clamp(x0+1.0, 0.0, texSize.x-1.0)
+		x0 = clamp(x0, 0.0, texSize.x-1.0)
+
+		var y0, y1, fy float
+		if (Flags & 4) != 0 {
+			y0 = floor(gy)
+			fy = gy - y0
+			y0 = mod(y0+texSize.y, texSize.y)
+			y1 = mod(y0+1.0, texSize.y)
+		} else {
+			y0 = floor(gy)
+			fy = gy - y0
+			y1 = clamp(y0+1.0, 0.0, texSize.y-1.0)
+			y0 = clamp(y0, 0.0, texSize.y-1.0)
+		}
+
+		v00, m00 := decode16(image0At(vec2(x0+0.5, y0+0.5)))
+		v10, m10 := decode16(image0At(vec2(x1+0.5, y0+0.5)))
+		v01, m01 := decode16(image0At(vec2(x0+0.5, y1+0.5)))
+		v11, m11 := decode16(image0At(vec2(x1+0.5, y1+0.5)))
+
+		w00 := (1.0 - fx) * (1.0 - fy) * m00
+		w10 := fx * (1.0 - fy) * m10
+		w01 := (1.0 - fx) * fy * m01
+		w11 := fx * fy * m11
+		wSum := w00 + w10 + w01 + w11
+		if wSum > 1e-5 {
+			valNorm = (v00*w00 + v10*w10 + v01*w01 + v11*w11) / wSum
+			valid = 1.0
+		}
+	}
+
+	if valid < 0.5 {
+		return vec4(0.0)
+	}
+
+	t := clamp((valNorm-VMinNorm)*InvSpanNorm, 0.0, 1.0)
+	// 在 256x1 色表纹理上进行半像素对齐线性采样，获得平滑连续伪彩输出
+	lutColor := image1Sample(vec2(t*255.0+0.5, 0.5))
+	return lutColor * Opacity
+}
