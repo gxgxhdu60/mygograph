@@ -251,13 +251,15 @@ func (s *XYSlice) RawXY() (xs, ys []float64, ok bool) {
 
 // UniformSlice 面向等间隔采样信号的数据源，同时实现 UniformSource 与 XYSource。
 type UniformSlice struct {
-	mu       sync.RWMutex
-	t0       float64
-	dt       float64
-	ys       []float64
-	yBounds  Range
-	boundsOK bool
-	ver      atomic.Uint64
+	mu        sync.RWMutex
+	t0        float64
+	dt        float64
+	ys        []float64
+	l1        []PyramidNode // 当 len(ys) >= 512 时自动构建 L1(B=64) 预聚合块，消除大数组跨 L3/RAM 带宽瓶颈
+	yBounds   Range
+	boundsOK  bool
+	allFinite bool
+	ver       atomic.Uint64
 }
 
 // NewUniformSlice 使用起始时间 t0、采样率 sampleRate (Hz) 与幅值切片创建等间隔数据源。
@@ -283,15 +285,25 @@ func (u *UniformSlice) SetData(t0, dt float64, ys []float64) {
 	if dt <= 0 || !isFinite(dt) {
 		dt = 1.0
 	}
-	yb, ok := analyzeY(ys)
+	yb, ok, clean, l1 := analyzeYAndBuildL1(ys)
 	u.mu.Lock()
 	u.t0 = t0
 	u.dt = dt
 	u.ys = ys
+	u.l1 = l1
 	u.yBounds = yb
 	u.boundsOK = ok
+	u.allFinite = clean
 	u.ver.Add(1)
 	u.mu.Unlock()
+}
+
+// AllFinite 返回当前数据切片是否全部为有限浮点数（不含 NaN 或 ±Inf），供降采样内核启用无校验极速通道。
+func (u *UniformSlice) AllFinite() bool {
+	u.mu.RLock()
+	clean := u.allFinite
+	u.mu.RUnlock()
+	return clean
 }
 
 func (u *UniformSlice) Len() int {
@@ -517,17 +529,49 @@ func analyzeXY(xs, ys []float64) (xb, yb Range, ok, monotonic bool) {
 	return Range{Min: xMin, Max: xMax}, Range{Min: yMin, Max: yMax}, true, monotonic
 }
 
-func analyzeY(ys []float64) (yb Range, ok bool) {
+func analyzeYAndBuildL1(ys []float64) (yb Range, ok, allFinite bool, l1 []PyramidNode) {
+	n := len(ys)
+	if n == 0 {
+		return Range{}, false, true, nil
+	}
+	if n >= PyramidBranch*8 {
+		l1Count := (n + PyramidBranch - 1) >> pyramidShift
+		l1 = make([]PyramidNode, l1Count)
+		yMin, yMax := math.Inf(1), math.Inf(-1)
+		allFinite = true
+		for b := range l1Count {
+			s0 := b << pyramidShift
+			s1 := min(s0+PyramidBranch, n)
+			nd := summarizeRawBlock(ys[s0:s1])
+			l1[b] = nd
+			if nd.HasNaN {
+				allFinite = false
+			}
+			if nd.Valid {
+				yMin = min(yMin, nd.Min)
+				yMax = max(yMax, nd.Max)
+				ok = true
+			}
+		}
+		if !ok {
+			return Range{}, false, allFinite, l1
+		}
+		return Range{Min: yMin, Max: yMax}, true, allFinite, l1
+	}
+
 	yMin, yMax := math.Inf(1), math.Inf(-1)
+	allFinite = true
 	for _, y := range ys {
 		if isFinite(y) {
 			yMin = min(yMin, y)
 			yMax = max(yMax, y)
 			ok = true
+		} else {
+			allFinite = false
 		}
 	}
 	if !ok {
-		return Range{}, false
+		return Range{}, false, allFinite, nil
 	}
-	return Range{Min: yMin, Max: yMax}, true
+	return Range{Min: yMin, Max: yMax}, true, allFinite, nil
 }
