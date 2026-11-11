@@ -26,6 +26,7 @@ const (
 	LUT16FlagFlipY   int32 = 1 << 0 // 将第 0 行置于物理坐标系底部（YMin）
 	LUT16FlagSmooth  int32 = 1 << 1 // 开启 16-bit 解码域双线性插值
 	LUT16FlagCyclicY int32 = 1 << 2 // 开启环形瀑布图循环行寻址
+	LUT16FlagFlipX   int32 = 1 << 3 // 将第 0 列置于屏幕右侧（视口 InvertX 时物理 x0 位于右侧）
 )
 
 // LUT16Program 封装已编译的 16-bit 标量伪彩着色器及预绑定的零分配 Uniform 句柄。

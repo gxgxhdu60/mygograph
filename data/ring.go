@@ -876,6 +876,7 @@ var shaderPackPool struct {
 	dstStride int
 	workCh    [numPackHelpers]chan int
 	doneCh    chan struct{}
+	panics    [numPackHelpers]any // 辅助协程捕获的 panic，由调用者协程在汇合后重新抛出
 	bufs      [numPackHelpers + 1]packWorkerScratch
 }
 
@@ -886,27 +887,98 @@ func initShaderPackPool() {
 		shaderPackPool.workCh[i] = ch
 		go func(c <-chan int) {
 			for workerID := range c {
-				r := shaderPackPool.ring
-				nCh := r.channels
-				ch0 := (workerID * nCh) / (numPackHelpers + 1)
-				ch1 := ((workerID + 1) * nCh) / (numPackHelpers + 1)
-				packChannelRange16(
-					r,
-					ch0, ch1,
-					shaderPackPool.buckets,
-					shaderPackPool.spanSlot0,
-					shaderPackPool.spanLen,
-					shaderPackPool.doDC,
-					shaderPackPool.quantMul,
-					shaderPackPool.dstPix,
-					shaderPackPool.dstStride,
-					shaderPackPool.bufs[workerID].minBuf[:shaderPackPool.buckets],
-					shaderPackPool.bufs[workerID].maxBuf[:shaderPackPool.buckets],
-					shaderPackPool.bufs[workerID].valBuf[:shaderPackPool.buckets],
-				)
-				shaderPackPool.doneCh <- struct{}{}
+				runPackHelper(workerID)
 			}
 		}(ch)
+	}
+}
+
+// runPackHelper 执行辅助分片；任何 panic 都被捕获并交由调用者协程重新抛出，
+// 且无论成功与否都会发送完成信号，避免后台协程崩溃进程或令调用者永久阻塞。
+func runPackHelper(workerID int) {
+	p := &shaderPackPool
+	defer func() {
+		if r := recover(); r != nil {
+			p.panics[workerID] = r
+		}
+		p.doneCh <- struct{}{}
+	}()
+	r := p.ring
+	nCh := r.channels
+	ch0 := (workerID * nCh) / (numPackHelpers + 1)
+	ch1 := ((workerID + 1) * nCh) / (numPackHelpers + 1)
+	packChannelRange16(
+		r,
+		ch0, ch1,
+		p.buckets,
+		p.spanSlot0,
+		p.spanLen,
+		p.doDC,
+		p.quantMul,
+		p.dstPix,
+		p.dstStride,
+		p.bufs[workerID].minBuf[:p.buckets],
+		p.bufs[workerID].maxBuf[:p.buckets],
+		p.bufs[workerID].valBuf[:p.buckets],
+	)
+}
+
+// packChannelsPooled 将全部导联拆分为 numPackHelpers+1 个分片并行打包；调用方须持有 m.mu 读锁。
+// 池互斥锁通过 defer 释放；主线程分片 panic 时仍会等待所有辅助分片汇合后才释放，
+// 辅助分片的 panic 在汇合后于调用者协程重新抛出（可被上层 recover）。
+func packChannelsPooled(m *MultiRingBuffer, buckets int, sSlot0, sLen []int32, doDC bool, quantMul float32, dstPix []byte, dstStride int) {
+	shaderPackPool.once.Do(initShaderPackPool)
+	p := &shaderPackPool
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.ring = m
+	p.buckets = buckets
+	p.spanSlot0 = sSlot0
+	p.spanLen = sLen
+	p.doDC = doDC
+	p.quantMul = quantMul
+	p.dstPix = dstPix
+	p.dstStride = dstStride
+
+	for i := range numPackHelpers {
+		p.workCh[i] <- i
+	}
+
+	var helperPanic any
+	func() {
+		defer func() {
+			for range numPackHelpers {
+				<-p.doneCh
+			}
+			for i := range p.panics {
+				if p.panics[i] != nil && helperPanic == nil {
+					helperPanic = p.panics[i]
+				}
+				p.panics[i] = nil
+			}
+			// 立即清空临时引用，确保 GC 不滞留任何环形缓冲或像素切片
+			p.ring = nil
+			p.spanSlot0 = nil
+			p.spanLen = nil
+			p.dstPix = nil
+		}()
+		// 调用者主线程同步执行最后一个分片，零上下文切换浪费
+		ch0 := (numPackHelpers * m.channels) / (numPackHelpers + 1)
+		packChannelRange16(
+			m,
+			ch0, m.channels,
+			buckets,
+			sSlot0, sLen,
+			doDC, quantMul,
+			dstPix, dstStride,
+			p.bufs[numPackHelpers].minBuf[:buckets],
+			p.bufs[numPackHelpers].maxBuf[:buckets],
+			p.bufs[numPackHelpers].valBuf[:buckets],
+		)
+	}()
+	if helperPanic != nil {
+		panic(helperPanic)
 	}
 }
 
@@ -933,6 +1005,15 @@ func (m *MultiRingBuffer) PackShaderEnvelope(
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+
+	// 目标纹理须容纳 2*channels 行、每行 buckets 个 RGBA 像素；不满足时（如通道数变化后纹理尚未重建）
+	// 直接放弃本帧，避免在后台分片协程中越界写入。
+	if m.channels > 0 {
+		rowBytes := buckets * 4
+		if dstStride < rowBytes || len(dstPix) < (2*m.channels-1)*dstStride+rowBytes {
+			return cursorNorm
+		}
+	}
 
 	sSlot0 := spanSlot0[:buckets]
 	sLen := spanLen[:buckets]
@@ -970,42 +1051,7 @@ func (m *MultiRingBuffer) PackShaderEnvelope(
 	}
 
 	if m.channels >= 64 && buckets <= maxPoolPackBucket {
-		shaderPackPool.once.Do(initShaderPackPool)
-		shaderPackPool.mu.Lock()
-		shaderPackPool.ring = m
-		shaderPackPool.buckets = buckets
-		shaderPackPool.spanSlot0 = sSlot0
-		shaderPackPool.spanLen = sLen
-		shaderPackPool.doDC = doDC
-		shaderPackPool.quantMul = quantMul
-		shaderPackPool.dstPix = dstPix
-		shaderPackPool.dstStride = dstStride
-
-		for i := range numPackHelpers {
-			shaderPackPool.workCh[i] <- i
-		}
-		// 调用者主线程同步执行第 4 分片，零上下文切换浪费
-		ch0 := (numPackHelpers * m.channels) / (numPackHelpers + 1)
-		packChannelRange16(
-			m,
-			ch0, m.channels,
-			buckets,
-			sSlot0, sLen,
-			doDC, quantMul,
-			dstPix, dstStride,
-			shaderPackPool.bufs[numPackHelpers].minBuf[:buckets],
-			shaderPackPool.bufs[numPackHelpers].maxBuf[:buckets],
-			shaderPackPool.bufs[numPackHelpers].valBuf[:buckets],
-		)
-		for range numPackHelpers {
-			<-shaderPackPool.doneCh
-		}
-		// 立即清空临时引用，确保 GC 不滞留任何环形缓冲或像素切片
-		shaderPackPool.ring = nil
-		shaderPackPool.spanSlot0 = nil
-		shaderPackPool.spanLen = nil
-		shaderPackPool.dstPix = nil
-		shaderPackPool.mu.Unlock()
+		packChannelsPooled(m, buckets, sSlot0, sLen, doDC, quantMul, dstPix, dstStride)
 		return cursorNorm
 	}
 

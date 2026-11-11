@@ -346,6 +346,10 @@ func (im *ImageItem) Draw(rc *mygograph.RenderContext) {
 	if needFlipY {
 		flags |= shaders.LUT16FlagFlipY
 	}
+	// 第 0 列对应物理 x0：视口 InvertX 时 x0 位于屏幕右侧，需翻转纹理 U 轴，使画面与坐标轴及 Snap 读数一致
+	if rc.View.InvertX() {
+		flags |= shaders.LUT16FlagFlipX
+	}
 	if im.smooth {
 		flags |= shaders.LUT16FlagSmooth
 	}
@@ -645,6 +649,9 @@ func (wf *WaterfallItem) Draw(rc *mygograph.RenderContext) {
 	// 因此当 newestAtTop=true 时始终翻转 uv.y，使最新谱线稳定位于屏幕顶部并向下滚动。
 	if newestTop {
 		flags |= shaders.LUT16FlagFlipY
+	}
+	if rc.View.InvertX() {
+		flags |= shaders.LUT16FlagFlipX
 	}
 	if smooth {
 		flags |= shaders.LUT16FlagSmooth

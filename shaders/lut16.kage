@@ -21,6 +21,7 @@ var Opacity float
 // bit 0 (1): FlipY（将纹理第 0 行映射至屏幕下方即物理 YMin 处）
 // bit 1 (2): Smooth（开启解码后 16-bit 标量双线性插值，消除高低字节进位锯齿）
 // bit 2 (4): CyclicY（开启环形瀑布图 Y 轴 fract 循环寻址）
+// bit 3 (8): FlipX（将纹理第 0 列映射至屏幕右侧，配合视口 InvertX）
 var Flags int
 
 func decode16(px vec4) (float, float) {
@@ -45,6 +46,9 @@ func Fragment(dst vec4, pos vec2) vec4 {
 
 	if (Flags & 1) != 0 {
 		uv.y = 1.0 - uv.y
+	}
+	if (Flags & 8) != 0 {
+		uv.x = 1.0 - uv.x
 	}
 	if (Flags & 4) != 0 {
 		uv.y = fract(uv.y + RowOffset)

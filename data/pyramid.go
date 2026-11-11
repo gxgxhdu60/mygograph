@@ -394,9 +394,10 @@ func (p *MinMaxPyramid) Query(vt ViewportTransform, buckets int, dst [][2]float3
 	}
 
 	// 自动选取最高层级 lvlIdx（对应步长 stride = 64^(lvlIdx+1)）；
-	// 每个 PyramidNode 已预存 4 个极值特征点（First/Min/Max/Last），因此当高层包含 >= buckets/2 个节点
-	// （即 >= 2*buckets 个极值顶点）时即可100%无损保留脉冲包络，同时将下层最大扫描节点数压缩 4 倍。
-	minNodes := max(buckets/2, 1)
+	// PyramidNode 只保存 First/Min/Max/Last、不保存极值位置；若一个节点跨越多个像素列，
+	// 相邻列包络会被合并、窄脉冲产生 1~2 px 偏移。因此要求选中层在视口内至少有 2*buckets 个节点
+	// （每像素列 >= 2 个节点），保证每个桶都由完整节点精确聚合出列内极值。
+	minNodes := max(2*buckets, 1)
 	lvlIdx := 0
 	for lvlIdx+1 < len(p.levels) {
 		nextShift := uint((lvlIdx + 2) * pyramidShift)
