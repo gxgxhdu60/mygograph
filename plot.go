@@ -152,6 +152,8 @@ type Plot struct {
 	localBotAx    ui.Rect
 	autoBtnRect   ui.Rect
 	hasAutoBtn    bool
+	liveBtnRect   ui.Rect
+	hasLiveBtn    bool
 
 	// 交互手势状态机
 	dragMode     dragAction
@@ -163,6 +165,8 @@ type Plot struct {
 	dragLastY    float32
 	hoverX       float32
 	hoverY       float32
+	contextMenuX float32
+	contextMenuY float32
 	pointerIn    bool
 	hoverCursor  ui.Cursor
 	lastMods     ui.Modifiers
@@ -303,6 +307,13 @@ func (p *Plot) Items() []Item { return p.items }
 // AutoRange 立即扫描所有可见图元的包围盒并重置双轴自动量程。
 func (p *Plot) AutoRange() {
 	p.vb.EnableAutoRange(AxisBoth)
+	p.updateAutoRangeFromItems()
+	p.Invalidate()
+}
+
+// ResumeLiveFollow 仅重新激活水平时间轴 X 的实时自动跟随（保留用户在 Y 轴上的单导联 Solo 放大状态）。
+func (p *Plot) ResumeLiveFollow() {
+	p.vb.EnableAutoRange(AxisX)
 	p.updateAutoRangeFromItems()
 	p.Invalidate()
 }
@@ -571,7 +582,25 @@ func (p *Plot) draw(painter *ui.Painter, r ui.Rect) {
 		p.legendHits = p.legendHits[:0]
 	}
 
-	// 9. 当用户手动平移/缩放偏离 AutoRange 时，在左下角显示 PyQtGraph 经典 [A] 一键复位角标
+	// 9. 统计活跃 StreamItem 版本（用于实时流 VSync 节流及历史回看 [Live] 恢复角标）
+	now := painter.Now()
+	var streamSum uint64
+	hasActiveStream := false
+	for _, it := range p.items {
+		if it == nil || !it.Visible() {
+			continue
+		}
+		if si, ok := it.(StreamItem); ok {
+			ver, active := si.StreamVersion()
+			if active {
+				hasActiveStream = true
+				streamSum = streamSum*1099511628211 + ver + 1
+			}
+		}
+	}
+
+	// 10. 当用户手动平移/缩放偏离 AutoRange 时，在左下角显示 PyQtGraph 经典 [A] 一键复位角标；
+	//     若当前存在实时流且 X 轴因回拖查看历史而解耦跟随，额外并列显示 [Live] 一键贴回最新采样尾部按钮。
 	if p.vb.IsManualOverride() {
 		btnLocal := ui.Rect{
 			X: p.localPlotRect.X + 6,
@@ -595,27 +624,38 @@ func (p *Plot) draw(painter *ui.Painter, r ui.Rect) {
 		bm := bf.Metrics()
 		sh := p.shapeOverlayText("A", bf)
 		painter.Glyphs(sh.glyphs, btnScreen.X+(btnScreen.W-sh.width)*0.5, btnScreen.Y+(btnScreen.H+bm.Ascent-bm.Descent)*0.5, fg)
+
+		if hasActiveStream && !p.vb.IsAutoX() {
+			shLive := p.shapeOverlayText("Live", bf)
+			liveLocal := ui.Rect{
+				X: btnLocal.X + btnLocal.W + 5,
+				Y: btnLocal.Y,
+				W: shLive.width + 14,
+				H: 18,
+			}
+			p.liveBtnRect = liveLocal
+			p.hasLiveBtn = true
+			liveScreen := offsetRect(liveLocal, r.X, r.Y)
+			liveHov := p.pointerIn && rectContains(liveLocal, p.hoverX, p.hoverY)
+			lBg := p.theme.ReadoutBg
+			lFg := p.theme.AccentColor
+			if liveHov {
+				lBg = p.theme.AccentColor
+				lFg = ui.RGB(10, 14, 20)
+			}
+			painter.Fill(liveScreen, lBg, 3)
+			painter.Stroke(liveScreen, p.theme.AccentColor, 3, 1)
+			painter.Glyphs(shLive.glyphs, liveScreen.X+7, liveScreen.Y+(liveScreen.H+bm.Ascent-bm.Descent)*0.5, lFg)
+		} else {
+			p.hasLiveBtn = false
+		}
 	} else {
 		p.hasAutoBtn = false
+		p.hasLiveBtn = false
 	}
 
-	// 10. VSync 实时流按需拉取与空闲 0% CPU 自动休眠门禁：
+	// 11. VSync 实时流按需拉取与空闲 0% CPU 自动休眠门禁：
 	//     仅当存在活跃 StreamItem 且其数据版本仍在推进（150ms 活跃窗口内）时请求下一帧 AnimationFrame！
-	now := painter.Now()
-	var streamSum uint64
-	hasActiveStream := false
-	for _, it := range p.items {
-		if it == nil || !it.Visible() {
-			continue
-		}
-		if si, ok := it.(StreamItem); ok {
-			ver, active := si.StreamVersion()
-			if active {
-				hasActiveStream = true
-				streamSum = streamSum*1099511628211 + ver + 1
-			}
-		}
-	}
 	if hasActiveStream {
 		if streamSum != p.lastStreamSum {
 			p.lastStreamSum = streamSum
@@ -893,7 +933,8 @@ func (p *Plot) handleInput(ev ui.InputEvent) bool {
 		}
 
 		newCursor := ui.CursorCrosshair
-		if p.hasAutoBtn && rectContains(p.autoBtnRect, ev.X, ev.Y) {
+		if (p.hasAutoBtn && rectContains(p.autoBtnRect, ev.X, ev.Y)) ||
+			(p.hasLiveBtn && rectContains(p.liveBtnRect, ev.X, ev.Y)) {
 			newCursor = ui.CursorPointer
 			needRedraw = true
 		} else if !inPlot {
@@ -937,10 +978,17 @@ func (p *Plot) handleInput(ev ui.InputEvent) bool {
 		p.dragStartX, p.dragStartY = ev.X, ev.Y
 		p.dragLastX, p.dragLastY = ev.X, ev.Y
 
-		// 1. 左键点击左下角 [A] 自动量程复位角标
+		// 1. 左键点击左下角 [A] 自动量程复位角标或 [Live] 恢复实时流尾部跟随角标
 		if ev.Button == 0 && p.hasAutoBtn && rectContains(p.autoBtnRect, ev.X, ev.Y) {
 			p.AutoRange()
 			return true
+		}
+		if ev.Button == 0 && p.hasLiveBtn && rectContains(p.liveBtnRect, ev.X, ev.Y) {
+			p.ResumeLiveFollow()
+			return true
+		}
+		if ev.Button == 1 {
+			p.contextMenuX, p.contextMenuY = ev.X, ev.Y
 		}
 
 		// 2. 左键点击图例项切换对应曲线显隐
@@ -1125,10 +1173,29 @@ func (p *Plot) handleInput(ev ui.InputEvent) bool {
 	return false
 }
 
+func (p *Plot) hasActiveStreamItem() bool {
+	for _, it := range p.items {
+		if it == nil || !it.Visible() {
+			continue
+		}
+		if si, ok := it.(StreamItem); ok {
+			if _, active := si.StreamVersion(); active {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (p *Plot) buildContextMenu(m *ui.Menu) {
 	if p.rightDragged {
 		p.rightDragged = false
 		return
+	}
+	if p.hasActiveStreamItem() && !p.vb.IsAutoX() {
+		if m.Item("Resume Live Follow (X)").Chosen() {
+			p.ResumeLiveFollow()
+		}
 	}
 	if m.Item("Reset Auto Range (A)").Chosen() {
 		p.AutoRange()
@@ -1139,6 +1206,25 @@ func (p *Plot) buildContextMenu(m *ui.Menu) {
 		}
 	}
 	m.Separator()
+
+	// 允许挂载的可视化图元根据右键点击位置注入上下文感知的专属参数调节菜单（如 EEG/ECG 导联与时基灵敏度、曲线降采样等）
+	lx := p.contextMenuX - p.localPlotRect.X
+	ly := p.contextMenuY - p.localPlotRect.Y
+	pw := max(p.localPlotRect.W, 1)
+	ph := max(p.localPlotRect.H, 1)
+	addedItemMenus := false
+	for _, it := range p.items {
+		if it == nil || !it.Visible() {
+			continue
+		}
+		if cmpItem, ok := it.(ContextMenuProvider); ok {
+			cmpItem.BuildContextMenu(m, lx, ly, pw, ph, p.vb)
+			addedItemMenus = true
+		}
+	}
+	if addedItemMenus {
+		m.Separator()
+	}
 
 	m.Submenu("Mouse Mode", func(sub *ui.Menu) {
 		if sub.Item("Pan Mode (3-Button)").Radio(p.vb.MouseMode() == PanMode).Chosen() {
@@ -1192,7 +1278,7 @@ func (p *Plot) buildContextMenu(m *ui.Menu) {
 		}
 	})
 
-	// 剪贴板导出当前视口 CSV（在 export.go 实现 FormatViewportCSV 后直接调用）
+	// 剪贴板导出当前视口 CSV 与高清离屏 PNG 导出
 	m.Separator()
 	if m.Item("Copy Viewport CSV").Chosen() {
 		csvText := p.buildViewportCSVString()
@@ -1200,6 +1286,11 @@ func (p *Plot) buildContextMenu(m *ui.Menu) {
 			p.lastCSVExport = csvText
 			p.services.WriteClipboard(csvText)
 		}
+	}
+	if m.Item("Export High-DPI PNG (2x)").Chosen() {
+		w := max(int(p.elemW), 800)
+		h := max(int(p.elemH), 480)
+		_ = p.SavePNG("mygograph_export_2x.png", w, h, 2.0)
 	}
 
 	if p.extraMenu != nil {

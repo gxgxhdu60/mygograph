@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/egoist/mygo/ui"
 )
@@ -46,9 +47,14 @@ func RenderFunc(view func(c *ui.Context), width, height int, scale float32) *ima
 	if scale <= 0 || math.IsNaN(float64(scale)) || math.IsInf(float64(scale), 0) {
 		scale = 1.0
 	}
-	// 首帧完成布局收敛与 AutoRange 计算，次帧输出稳定对齐的最终超采样帧
-	_ = ui.Render(view, width, height, scale)
-	return ui.Render(view, width, height, scale)
+	// 先在 1x 逻辑分辨率下完成布局收敛与跨子图边距同步，随后推进离屏时钟越过流式节流窗口，使超采样倍率仅执行单帧光栅化
+	tt := ui.NewTester(view, width, height)
+	tt.Advance(250 * time.Millisecond)
+	tt.Frame()
+	if scale != 1.0 {
+		tt.SetScale(scale)
+	}
+	return tt.Image()
 }
 
 // EncodePNG 将离屏超采样渲染结果编码为 PNG 字节流写入 w。

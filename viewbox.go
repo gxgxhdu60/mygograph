@@ -232,6 +232,12 @@ func (vb *ViewBox) IsManualOverride() bool {
 	return !vb.autoX || !vb.autoY
 }
 
+// IsAutoX 返回水平 X 轴当前是否处于自动跟随最新数据范围状态（用于实时流 Live Follow 指示与一键恢复）。
+func (vb *ViewBox) IsAutoX() bool { return vb.autoX }
+
+// IsAutoY 返回垂直 Y 轴当前是否处于自动量程状态。
+func (vb *ViewBox) IsAutoY() bool { return vb.autoY }
+
 // EnableAutoRange 重新激活指定轴的自动量程并清空手动缩放历史栈。
 func (vb *ViewBox) EnableAutoRange(mask AxisMask) {
 	if mask&AxisX != 0 {

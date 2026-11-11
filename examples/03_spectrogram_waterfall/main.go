@@ -169,7 +169,13 @@ func main() {
 		mygograph.WithBottomAxis(mygograph.NewTimeAxis(mygograph.AxisBottom, "Time")),
 		mygograph.WithLeftAxis(mygograph.NewAxis(mygograph.AxisLeft).SetLabel("Amplitude").SetUnit("V")),
 	)
-	waveCurve := items.NewCurve(waveRing, items.WithName("ADC In"), items.WithColor(th.SeriesColor(0)))
+	waveCurve := items.NewCurve(
+		waveRing,
+		items.WithName("ADC In"),
+		items.WithColor(th.SeriesColor(0)),
+		items.WithCurveWindowSeconds(waveWinSec),
+	)
+	wavePlot.ViewBox().SetYRange(-1.25, 1.25, 0)
 	wavePlot.AddItem(waveCurve, items.NewCrosshair(items.WithSnapTarget(waveCurve)))
 
 	specPlot := mygograph.NewPlot(
@@ -207,12 +213,6 @@ func main() {
 	var paused atomic.Bool
 
 	buildUI := func(c *ui.Context) {
-		tLatest := waveRing.LatestTime()
-		if tLatest > waveWinSec {
-			wavePlot.ViewBox().SetXRange(tLatest-waveWinSec, tLatest, 0)
-			wavePlot.ViewBox().SetYRange(-1.25, 1.25, 0)
-		}
-
 		ui.Column(c).Fill().Background(th.Background).Children(func() {
 			ui.Row(c).FillWidth().Padding(8, 12).Gap(8).Background(th.PanelSurface).Children(func() {
 				pLabel := "Pause STFT"

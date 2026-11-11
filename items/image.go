@@ -744,3 +744,64 @@ func bilinearFromGrid(raw []float64, cols, rows int, u, v float64) (float64, boo
 	}
 	return sum / wSum, true
 }
+
+func buildColorControlMenu(sub *ui.Menu, ctrl *colormap.ColorControl) {
+	if ctrl == nil {
+		return
+	}
+	if sub.Item("Auto Reset Contrast Levels").Chosen() {
+		ctrl.ResetLevels()
+	}
+	sub.Separator()
+	curName := ctrl.Colormap().Name()
+	for _, cm := range colormap.BuiltinColormaps() {
+		if sub.Item("Colormap: " + cm.Name()).Radio(cm.Name() == curName).Chosen() {
+			ctrl.SetColormap(cm)
+		}
+	}
+}
+
+// BuildContextMenu 实现 mygograph.ContextMenuProvider：支持直接在热力图上右键切换色表、平滑插值与重置窗位。
+func (im *ImageItem) BuildContextMenu(m *ui.Menu, _, _, _, _ float32, _ *mygograph.ViewBox) {
+	title := "Heatmap Options"
+	if im.name != "" {
+		title = "Heatmap: " + im.name
+	}
+	m.Submenu(title, func(sub *ui.Menu) {
+		if sub.Item("Smooth Bilinear Filter").Checked(im.smooth).Chosen() {
+			im.smooth = !im.smooth
+		}
+		sub.Separator()
+		buildColorControlMenu(sub, im.ctrl)
+	})
+}
+
+// BuildContextMenu 实现 mygograph.ContextMenuProvider：支持在实时瀑布图上右键切换色表、流向与平滑滤波。
+func (wf *WaterfallItem) BuildContextMenu(m *ui.Menu, _, _, _, _ float32, _ *mygograph.ViewBox) {
+	title := "Waterfall Options"
+	if wf.name != "" {
+		title = "Waterfall: " + wf.name
+	}
+	m.Submenu(title, func(sub *ui.Menu) {
+		wf.mu.Lock()
+		smooth := wf.smooth
+		top := wf.newestAtTop
+		wf.mu.Unlock()
+
+		if sub.Item("Newest Frame at Top").Checked(top).Chosen() {
+			wf.SetNewestAtTop(!top)
+		}
+		if sub.Item("Smooth Bilinear Filter").Checked(smooth).Chosen() {
+			wf.mu.Lock()
+			wf.smooth = !wf.smooth
+			wf.mu.Unlock()
+		}
+		sub.Separator()
+		buildColorControlMenu(sub, wf.ctrl)
+	})
+}
+
+var (
+	_ mygograph.ContextMenuProvider = (*ImageItem)(nil)
+	_ mygograph.ContextMenuProvider = (*WaterfallItem)(nil)
+)

@@ -640,6 +640,11 @@ func main() {
    - 新增 `ViewBox.AddChangeListener` 支持外部联动组件（如 `LinearRegion.BindDetailViewBox`）无损挂载双向监听而不覆盖宿主 `Plot` 内部刷新钩子；通过 `ObserveInput` 追踪右键拖拽位移阈值（`> 3 DIP`），完美区分“右键按住双轴无级锚点缩放”与“原地右键单击弹出工程上下文菜单”。
 5. **统一 `SnapTarget` 二维标量场拾取与 `InvertY` 环形瀑布一致性**：
    - `CurveItem`、`ScatterItem`、`ImageItem`、`WaterfallItem` 统一实现 `mygograph.SnapTarget` 接口，使 `Crosshair` 在一维曲线、百万散点、静态热力图及开启 `InvertY` 的实时环形滚动瀑布图上均可直接读取精确物理量纲数值。
+6. **对标 `PyQtGraph` 与临床 EEG/ECG 监护的实时交互增强**：
+   - **图元级上下文感知右键调参（`ContextMenuProvider`）**：`Plot` 在 `InputPointerDown (Button == 1)` 瞬间冻结点击局部坐标并分发给可见图元，使 `MultiChannelItem`（命中导联 Solo/坏道静音/独立倍率 `0.1x~5x`、临床灵敏度 `20 μV~2 mV/ch`、标准走纸时基 `1 s~30 s`）、`CurveItem`（`M4/LTTB` 降采样、阶梯线、线宽、流式时基）与 `ImageItem`/`WaterfallItem`（色表、平滑插值、自动对比度）均支持在不断流的情况下原地右键调参。
+   - **单导联独立增益（`chGains`）零分配融合**：`MultiRingBuffer.PackShaderEnvelope` 支持按导联独立乘算归一化因子（工作池任务结束自动清零切片引用），解决脑电（`±100 μV`）与心电/眼电（`±2 mV`）同屏混合采集时的幅值量级跨越问题，且保持稳态 `0 B/op, 0 allocs/op`。
+   - **实时跟随、拖拽回看自动冻结与 `[Live]` 一键归位**：利用 `ViewBox` 独立的 `autoX` / `autoY` 状态机，在 `Roll` 模式下左键回拉历史波形自动挂起 `autoX`（后台采集持续入环但不冲走当前回看窗口，且保留 Y 轴单导联 Solo 放大），同时在左下角渲染交互式 `[Live]` 按钮并在右键菜单注入 `Resume Live Follow (X)`。
+   - **医疗标准 `L` 型物理校准标尺（`ScaleBarItem`）与高密度事件打标（`EventMarkersItem`）**：自动按 `1-2-5 × 10^k` 优选物理时间/幅值参考尺（稳态字形与字符串缓存 `0 allocs/op`），并提供支持 `Roll` 二分裁剪与 `Sweep` 循环相位擦除对齐的并发安全刺激/棘波事件标记层。
 
 ### 10.1 实测性能门禁汇总（`Go 1.27.3`, `CGO_ENABLED=0`, `AMD Ryzen 7 8845HS`）
 

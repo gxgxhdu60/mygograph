@@ -17,8 +17,10 @@
   - **视觉趋势精选 `LTTB`** 与并发安全无分配 **`RingBuffer` / `MultiRingBuffer`**。
 - **GPU Kage 着色器双快路径（`shaders` & `colormap`）**
   - **`lut16.kage` 16-bit 动态伪彩与单 DrawCall 环形瀑布图**：将标量矩阵高 8 位/低 8 位打包至 `R/G` 通道（`65536` 级量化），配合 `Viridis`、`Plasma`、`Inferno`、`Magma`、`Cividis`、`Turbo`、`Coolwarm`、`Grayscale` 色表，拖动 `HistogramLUT` 调节窗宽窗位时 **CPU 像素重算 `0 ms`**（纯 Uniform 更新）；`WaterfallItem` 通过 `fract(uv.y + RowOffset)` 环形寻址实现零内存整图搬移滚动。
-  - **`multistack.kage` 256 导联并行实时波形引擎**：`<= 32` 导联走矢量快路径，`> 32` 导联自动切换至单次 DrawCall 紧凑极值数据纹理 + 片段着色器亚像素抗锯齿管线；配合 L3 缓存常驻保序 `int32` 镜像、`B=8` 分块预聚合与 4 路常驻零分配并行打包工作池，**`256` 导联 × `1000 Hz` × `10 s` 视口单帧仅需 `~1.62 ms`（`0 allocs/op`）**，原生支持滚动走纸（Roll）与医疗监护仪擦除扫描条（Sweep / Erase-Bar）双模式、硬件级实时去直流偏置（DC Removal）、坏道灰化与双击单导联独奏放大（Solo）。
-- **完备工程测量、ROI 切片与导出工具链（`items` & `export.go`）**
+  - **`multistack.kage` 256 导联并行实时波形引擎**：`<= 32` 导联走矢量快路径，`> 32` 导联自动切换至单次 DrawCall 紧凑极值数据纹理 + 片段着色器亚像素抗锯齿管线；配合 L3 缓存常驻保序 `int32` 镜像、`B=8` 分块预聚合与 4 路常驻零分配并行打包工作池，**`256` 导联 × `1000 Hz` × `10 s` 视口单帧仅需 `~1.41 ms`（`0 allocs/op`）**，原生支持滚动走纸（Roll）与医疗监护仪擦除扫描条（Sweep / Erase-Bar）双模式、硬件级实时去直流偏置（DC Removal）、坏道灰化、**单导联独立倍率（如 μV 级脑电与 mV 级 ECG/EOG 同屏共显）**与双击单导联独奏放大（Solo）。
+- **完备工程测量、临床 EEG/ECG 监护、ROI 切片与导出工具链（`items` & `export.go`）**
+  - **原地右键波形调参（`ContextMenuProvider`）与历史回看冻结恢复（`[Live]`）**：直接右键任意导联、实时曲线或热力瀑布图即可弹出上下文感知参数菜单（单导联 Solo/坏道静音/独立增益 `0.1x~5x`、临床灵敏度 `20 μV~2 mV/ch`、标准走纸时基 `1 s~30 s`、`M4/LTTB` 降采样切换、色表切换）；`Roll` 模式下左键拖拽向历史回看自动冻结视口并在左下角浮现 **`[Live]`** 胶囊角标，单击一键追回实时尾部且不丢失单导联 Solo 放大状态。
+  - **临床物理标尺与高频事件打标**：内置无刻度时的医疗标准 **`L` 型物理校准标尺**（如 `100 μV × 1 s`，自动选取 `1-2-5 × 10^k` SI 整步长，支持 `MultiChannelItem` 内置叠加或独立 `ScaleBarItem`），以及线程安全高密度 **`EventMarkersItem` 刺激触发/癫痫棘波事件标记层**（支持 `Roll` 二分裁剪与 `Sweep` 循环相位对齐擦除）。
   - **工程坐标轴与多图对齐**：`LinearScale` / `LogScale` / `TimeScale` 自动 SI 国际单位词头（`f, p, n, μ, m, k, M, G, T`），`ui.Shape` 字形缓存 + 启用 `"tnum"` 等宽表格数字防抖动；`GraphLayout` 自动同步上下多子图左侧 Y 轴像素边距（误差 `0 px`）。
   - **游标与交互剖析**：`InfiniteLine`（垂直/水平/任意倾角参考线）、`CursorMeasureItem`（实时读取 `Δt`、`1/Δt`、`ΔY`、`Vpp`、`RMS`）、`Crosshair`（自动就近吸附真实采样点）、`LinearRegion`（概览-详情双向联动截取）、`RectROI`（8 手柄二维子矩阵提取）、`LineROI`（双线性插值剖面线实时提取）、`ScatterItem`（6 种几何标记 + 屏幕像素去重 + `512×512` CSR 空间网格 `< 1 μs` 百万点悬停拾取）。
   - **按需休眠与高清导出**：数据流暂停且无交互时自动停止请求 `AnimationFrame`（**`0%` 空闲 CPU 占用**）；内置右键菜单与编程 API 一键导出 `2×`/`3×` HiDPI 出版级 PNG 及当前视口全精度 CSV。
@@ -111,8 +113,8 @@ mygograph/
 ├── scale.go               # LinearScale / LogScale / TimeScale 与 SI 国际单位词头自动格式化
 ├── viewbox.go             # float64 相机相对坐标变换、缩放历史栈、范围约束与 LinkX/LinkY 双向同步
 ├── axis.go                # 坐标轴组件（ui.Shape 字形缓存 + OpenType "tnum" 等宽数字防抖）
-├── item.go                # Item / OverlayItem / InteractiveItem / SnapTarget / StreamItem 核心协议
-├── plot.go                # Plot 画布手势状态机、网格纹理缓存、图例面板与按需重绘节流引擎
+├── item.go                # Item / OverlayItem / InteractiveItem / SnapTarget / StreamItem / ContextMenuProvider 核心协议
+├── plot.go                # Plot 画布手势状态机、[Live] 实时跟随恢复、图元右键调参分发、网格缓存与节流引擎
 ├── layout.go              # GraphLayout 多子图网格与跨行左侧 Y 轴像素级边距对齐
 ├── export.go              # 2x/3x 倍采样离屏 PNG 导出与当前视口全精度 CSV 导出
 ├── data/
@@ -131,7 +133,8 @@ mygograph/
 │   ├── curve.go           # CurveItem 高通量折线/阶梯线/基线填充与亚毫秒级就近吸附
 │   ├── cursor.go          # InfiniteLine 参考线、CursorMeasureItem 游标统计与 Crosshair 十字准星
 │   ├── image.go           # ImageItem 16-bit GPU 热力图与 WaterfallItem 环形滚动瀑布图
-│   ├── multichannel.go    # MultiChannelItem 双模（矢量 / GPU Shader）高密度多导联实时流引擎
+│   ├── multichannel.go    # MultiChannelItem 双模高密度多导联引擎（支持单导联独立增益、原地右键调参与 L 型标尺）
+│   ├── markers.go         # EventMarkersItem 实时刺激/棘波事件打标层与独立 ScaleBarItem 医疗物理校准标尺
 │   ├── roi.go             # LinearRegion 联动选区、RectROI 8 手柄矩形框与 LineROI 剖面采样器
 │   └── scatter.go         # ScatterItem 多形状标记、像素位图去重与 512×512 CSR 空间网格拾取
 └── examples/              # 四大核心科研/工业场景完整可运行示例

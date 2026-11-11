@@ -872,6 +872,7 @@ var shaderPackPool struct {
 	spanLen   []int32
 	doDC      bool
 	quantMul  float32
+	chScales  []float32
 	dstPix    []byte
 	dstStride int
 	workCh    [numPackHelpers]chan int
@@ -915,6 +916,7 @@ func runPackHelper(workerID int) {
 		p.spanLen,
 		p.doDC,
 		p.quantMul,
+		p.chScales,
 		p.dstPix,
 		p.dstStride,
 		p.bufs[workerID].minBuf[:p.buckets],
@@ -926,7 +928,7 @@ func runPackHelper(workerID int) {
 // packChannelsPooled 将全部导联拆分为 numPackHelpers+1 个分片并行打包；调用方须持有 m.mu 读锁。
 // 池互斥锁通过 defer 释放；主线程分片 panic 时仍会等待所有辅助分片汇合后才释放，
 // 辅助分片的 panic 在汇合后于调用者协程重新抛出（可被上层 recover）。
-func packChannelsPooled(m *MultiRingBuffer, buckets int, sSlot0, sLen []int32, doDC bool, quantMul float32, dstPix []byte, dstStride int) {
+func packChannelsPooled(m *MultiRingBuffer, buckets int, sSlot0, sLen []int32, doDC bool, quantMul float32, chScales []float32, dstPix []byte, dstStride int) {
 	shaderPackPool.once.Do(initShaderPackPool)
 	p := &shaderPackPool
 	p.mu.Lock()
@@ -938,6 +940,7 @@ func packChannelsPooled(m *MultiRingBuffer, buckets int, sSlot0, sLen []int32, d
 	p.spanLen = sLen
 	p.doDC = doDC
 	p.quantMul = quantMul
+	p.chScales = chScales
 	p.dstPix = dstPix
 	p.dstStride = dstStride
 
@@ -961,6 +964,7 @@ func packChannelsPooled(m *MultiRingBuffer, buckets int, sSlot0, sLen []int32, d
 			p.ring = nil
 			p.spanSlot0 = nil
 			p.spanLen = nil
+			p.chScales = nil
 			p.dstPix = nil
 		}()
 		// 调用者主线程同步执行最后一个分片，零上下文切换浪费
@@ -970,7 +974,7 @@ func packChannelsPooled(m *MultiRingBuffer, buckets int, sSlot0, sLen []int32, d
 			ch0, m.channels,
 			buckets,
 			sSlot0, sLen,
-			doDC, quantMul,
+			doDC, quantMul, chScales,
 			dstPix, dstStride,
 			p.bufs[numPackHelpers].minBuf[:buckets],
 			p.bufs[numPackHelpers].maxBuf[:buckets],
@@ -982,7 +986,7 @@ func packChannelsPooled(m *MultiRingBuffer, buckets int, sSlot0, sLen []int32, d
 	}
 }
 
-// PackShaderEnvelope 在单次读锁内完成全部导联的极值降采样、可选实时去直流（DC Removal）与 16-bit RGBA 包络纹理打包（0 allocs/op）。
+// PackShaderEnvelope 在单次读锁内完成全部导联的极值降采样、可选实时去直流（DC Removal）、单导联独立倍率（chScales，传 nil 则统一为 1.0）与 16-bit RGBA 包络纹理打包（0 allocs/op）。
 // 当通道数 >= 64 且 buckets <= 4096 时，自动唤醒 4 路零分配并行工作分片，在多核降频/满载压力下仍确保 256ch x 1kHz x 10s 远低于 6ms 门禁。
 func (m *MultiRingBuffer) PackShaderEnvelope(
 	tStart, tEnd float64,
@@ -991,6 +995,7 @@ func (m *MultiRingBuffer) PackShaderEnvelope(
 	buckets int,
 	doDC bool,
 	quantMul float32,
+	chScales []float32,
 	dstPix []byte,
 	dstStride int,
 	spanSlot0, spanLen []int32,
@@ -1051,11 +1056,11 @@ func (m *MultiRingBuffer) PackShaderEnvelope(
 	}
 
 	if m.channels >= 64 && buckets <= maxPoolPackBucket {
-		packChannelsPooled(m, buckets, sSlot0, sLen, doDC, quantMul, dstPix, dstStride)
+		packChannelsPooled(m, buckets, sSlot0, sLen, doDC, quantMul, chScales, dstPix, dstStride)
 		return cursorNorm
 	}
 
-	packChannelRange16(m, 0, m.channels, buckets, sSlot0, sLen, doDC, quantMul, dstPix, dstStride, minScratch[:buckets], maxScratch[:buckets], valScratch[:buckets])
+	packChannelRange16(m, 0, m.channels, buckets, sSlot0, sLen, doDC, quantMul, chScales, dstPix, dstStride, minScratch[:buckets], maxScratch[:buckets], valScratch[:buckets])
 	return cursorNorm
 }
 
@@ -1066,6 +1071,7 @@ func packChannelRange16(
 	sSlot0, sLen []int32,
 	doDC bool,
 	quantMul float32,
+	chScales []float32,
 	pix []byte,
 	stride int,
 	dMin, dMax []float32,
@@ -1176,7 +1182,11 @@ func packChannelRange16(
 		if doDC && cnt > 0 {
 			dcMean = sum / float32(cnt*2)
 		}
-		bias := float32(32768.5) - dcMean*quantMul
+		chQMul := quantMul
+		if ch < len(chScales) {
+			chQMul *= chScales[ch]
+		}
+		bias := float32(32768.5) - dcMean*chQMul
 		rowMinPix := pix[(2*ch)*stride : (2*ch)*stride+buckets*4]
 		rowMaxPix := pix[(2*ch+1)*stride : (2*ch+1)*stride+buckets*4]
 
@@ -1189,7 +1199,7 @@ func packChannelRange16(
 				pMax[0], pMax[1], pMax[2], pMax[3] = 0, 0, 0, 255
 				continue
 			}
-			qfLo := dMin[b]*quantMul + bias
+			qfLo := dMin[b]*chQMul + bias
 			if qfLo < 1.5 {
 				qfLo = 1.5
 			} else if qfLo > 65535.5 {
@@ -1201,7 +1211,7 @@ func packChannelRange16(
 			pMin[2] = 255
 			pMin[3] = 255
 
-			qfHi := dMax[b]*quantMul + bias
+			qfHi := dMax[b]*chQMul + bias
 			if qfHi < 1.5 {
 				qfHi = 1.5
 			} else if qfHi > 65535.5 {

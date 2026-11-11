@@ -152,3 +152,9 @@ type CSVSeries struct {
 type ViewportCSVProvider interface {
 	ExportViewportCSV(vb *ViewBox) (CSVSeries, bool)
 }
+
+// ContextMenuProvider 可选接口：允许图元根据右键点击处的局部绘图区坐标 (lx, ly)
+// 动态向 Plot 上下文菜单注入专属参数调节项（如 EEG/ECG 单导联独立增益、坏道屏蔽、时基切换或曲线降采样模式）。
+type ContextMenuProvider interface {
+	BuildContextMenu(m *ui.Menu, lx, ly, plotW, plotH float32, vb *ViewBox)
+}

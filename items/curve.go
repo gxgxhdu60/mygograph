@@ -80,6 +80,15 @@ func WithStreaming(active bool) CurveOption {
 	}
 }
 
+// WithCurveWindowSeconds 设置实时流曲线在自动跟随（Live Follow）模式下的滑动时间窗宽度（秒，0 表示铺满整个 RingBuffer）。
+func WithCurveWindowSeconds(sec float64) CurveOption {
+	return func(c *CurveItem) {
+		if sec >= 0 {
+			c.windowSec = sec
+		}
+	}
+}
+
 // CurveItem 是高性能一维折线/阶梯线/包络填充图元，稳态帧渲染 0 B/op、0 allocs/op。
 type CurveItem struct {
 	src             data.XYSource
@@ -88,6 +97,7 @@ type CurveItem struct {
 	width           float32
 	decimateMode    data.DecimateMode
 	stepMode        StepMode
+	windowSec       float64
 	visible         bool
 	z               float32
 	hasBaselineFill bool
@@ -179,7 +189,51 @@ func (c *CurveItem) Bounds() (xRange, yRange data.Range, ok bool) {
 	if c.src == nil {
 		return data.Range{}, data.Range{}, false
 	}
-	return c.src.Bounds()
+	xr, yr, ok := c.src.Bounds()
+	if ok && c.windowSec > 0 {
+		if _, isRing := c.src.(*data.RingBuffer); isRing {
+			if xr.Max <= c.windowSec {
+				xr = data.Range{Min: 0, Max: c.windowSec}
+			} else {
+				xr = data.Range{Min: xr.Max - c.windowSec, Max: xr.Max}
+			}
+		}
+	}
+	return xr, yr, ok
+}
+
+// SetDecimateMode 动态切换曲线降采样策略（如 DecimateAuto / DecimateM4 / DecimateLTTB / DecimateNone）。
+func (c *CurveItem) SetDecimateMode(mode data.DecimateMode) *CurveItem {
+	c.decimateMode = mode
+	return c
+}
+
+// DecimateMode 返回当前曲线降采样策略。
+func (c *CurveItem) DecimateMode() data.DecimateMode { return c.decimateMode }
+
+// SetStepMode 动态切换阶梯连接样式。
+func (c *CurveItem) SetStepMode(mode StepMode) *CurveItem {
+	c.stepMode = mode
+	return c
+}
+
+// SetWidth 动态修改曲线线宽（DIP）。
+func (c *CurveItem) SetWidth(width float32) *CurveItem {
+	if width > 0 {
+		c.width = width
+	}
+	return c
+}
+
+// WindowSeconds 返回实时流曲线当前的自动跟随时间窗长度（秒，0 表示全缓冲跨度）。
+func (c *CurveItem) WindowSeconds() float64 { return c.windowSec }
+
+// SetWindowSeconds 动态设置实时流曲线的自动跟随时间窗长度（秒，0 表示全缓冲跨度）。
+func (c *CurveItem) SetWindowSeconds(sec float64) *CurveItem {
+	if sec >= 0 {
+		c.windowSec = sec
+	}
+	return c
 }
 
 func (c *CurveItem) projectPoints(vt data.ViewportTransform, buckets int, dst [][2]float32) [][2]float32 {
@@ -479,6 +533,82 @@ func (c *CurveItem) ExportViewportCSV(vb *mygograph.ViewBox) (mygograph.CSVSerie
 		Columns: [][]float64{xs, ys},
 	}, true
 }
+
+// BuildContextMenu 实现 mygograph.ContextMenuProvider：复刻 PyQtGraph PlotDataItem 右键参数调节菜单（降采样模式、阶梯线、线宽与实时时基窗口）。
+func (c *CurveItem) BuildContextMenu(m *ui.Menu, _, _, _, _ float32, vb *mygograph.ViewBox) {
+	title := "Curve Options"
+	if c.name != "" {
+		title = "Curve: " + c.name
+	}
+	m.Submenu(title, func(sub *ui.Menu) {
+		sub.Submenu("Downsample", func(ds *ui.Menu) {
+			isM4 := c.decimateMode == data.DecimateAuto || c.decimateMode == data.DecimateM4
+			if ds.Item("Peak Envelope (M4 Auto)").Radio(isM4).Chosen() {
+				c.decimateMode = data.DecimateAuto
+			}
+			if ds.Item("Visual Smooth (LTTB)").Radio(c.decimateMode == data.DecimateLTTB).Chosen() {
+				c.decimateMode = data.DecimateLTTB
+			}
+			if ds.Item("Off (Raw Points)").Radio(c.decimateMode == data.DecimateNone).Chosen() {
+				c.decimateMode = data.DecimateNone
+			}
+		})
+		sub.Submenu("Step Mode", func(sm *ui.Menu) {
+			if sm.Item("Linear Connect").Radio(c.stepMode == StepNone).Chosen() {
+				c.stepMode = StepNone
+			}
+			if sm.Item("Step Post (ZOH)").Radio(c.stepMode == StepPost).Chosen() {
+				c.stepMode = StepPost
+			}
+			if sm.Item("Step Mid").Radio(c.stepMode == StepMid).Chosen() {
+				c.stepMode = StepMid
+			}
+		})
+		sub.Submenu("Line Width", func(lw *ui.Menu) {
+			widths := []struct {
+				label string
+				w     float32
+			}{
+				{"Thin (1.0 px)", 1.0},
+				{"Standard (1.5 px)", 1.5},
+				{"Bold (2.5 px)", 2.5},
+			}
+			for _, item := range widths {
+				active := math.Abs(float64(c.width-item.w)) < 0.15
+				if lw.Item(item.label).Radio(active).Chosen() {
+					c.width = item.w
+				}
+			}
+		})
+		if _, isRing := c.src.(*data.RingBuffer); isRing {
+			sub.Separator()
+			sub.Submenu("Stream Timebase", func(tb *ui.Menu) {
+				wins := []struct {
+					label string
+					sec   float64
+				}{
+					{"250 ms", 0.25},
+					{"1 s", 1.0},
+					{"2 s", 2.0},
+					{"5 s", 5.0},
+					{"10 s", 10.0},
+					{"Full Buffer", 0.0},
+				}
+				for _, w := range wins {
+					active := math.Abs(c.windowSec-w.sec) < 0.02
+					if tb.Item(w.label).Radio(active).Chosen() {
+						c.windowSec = w.sec
+						if vb != nil {
+							vb.EnableAutoRange(mygograph.AxisX)
+						}
+					}
+				}
+			})
+		}
+	})
+}
+
+var _ mygograph.ContextMenuProvider = (*CurveItem)(nil)
 
 func isNaN32(v float32) bool {
 	return v != v || math.IsInf(float64(v), 0)
