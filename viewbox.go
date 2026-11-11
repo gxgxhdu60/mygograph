@@ -87,8 +87,9 @@ type ViewBox struct {
 	linkedY []*ViewBox
 	syncing bool
 
-	onChange func()
-	rev      uint64
+	onChange  func()
+	listeners []func(*ViewBox)
+	rev       uint64
 }
 
 // NewViewBox 创建默认视口 [-1, 1] × [-1, 1]、开启双轴自动量程的 ViewBox。
@@ -110,8 +111,15 @@ func NewViewBox() *ViewBox {
 // Revision 返回视口状态修订号（每次平移、缩放或范围变更递增，用于网格缓存失效判定）。
 func (vb *ViewBox) Revision() uint64 { return vb.rev }
 
-// SetOnChange 注册视口变更回调（用于通知宿主或关联面板刷新）。
+// SetOnChange 注册视口变更回调（用于通知宿主 Plot 刷新）。
 func (vb *ViewBox) SetOnChange(fn func()) { vb.onChange = fn }
+
+// AddChangeListener 追加外部视口变更观察者（如 LinearRegion 双向联动监听，不覆盖宿主 Plot 的 onChange）。
+func (vb *ViewBox) AddChangeListener(fn func(*ViewBox)) {
+	if fn != nil {
+		vb.listeners = append(vb.listeners, fn)
+	}
+}
 
 // MouseMode 返回当前左键拖拽模式。
 func (vb *ViewBox) MouseMode() MouseMode { return vb.mouseMode }
@@ -802,6 +810,9 @@ func (vb *ViewBox) bump() {
 	vb.rev++
 	if vb.onChange != nil {
 		vb.onChange()
+	}
+	for _, fn := range vb.listeners {
+		fn(vb)
 	}
 }
 
