@@ -1,7 +1,6 @@
 package mygograph
 
 import (
-	"bytes"
 	"fmt"
 	"image"
 	"image/png"
@@ -16,8 +15,40 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-func init() {
-	csvExportHook = FormatViewportCSV
+// writeFileAtomic 在目标目录内创建临时文件写入完整内容后原子重命名至 path，避免导出中断留下截断文件。
+func writeFileAtomic(path string, write func(io.Writer) error) error {
+	dir := filepath.Dir(path)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	done := false
+	defer func() {
+		if !done {
+			tmp.Close()
+			os.Remove(tmpName)
+		}
+	}()
+	if err := write(tmp); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	done = true
+	return nil
 }
 
 // Viewable 抽象所有可通过 View(c *ui.Context) 挂载渲染的图表组件（如 *Plot、*GraphLayout、*ColorBar、*HistogramLUT）。
@@ -82,16 +113,9 @@ func SavePNG(path string, v Viewable, width, height int, scale float32) error {
 	if path == "" {
 		return fmt.Errorf("mygograph: empty output path")
 	}
-	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
-		}
-	}
-	var buf bytes.Buffer
-	if err := EncodePNG(&buf, v, width, height, scale); err != nil {
-		return err
-	}
-	return os.WriteFile(path, buf.Bytes(), 0o644)
+	return writeFileAtomic(path, func(w io.Writer) error {
+		return EncodePNG(w, v, width, height, scale)
+	})
 }
 
 // SavePNGFunc 将自定义 mygo 视图函数（例如组合了顶部工具栏 + GraphLayout + 右侧 HistogramLUT 的完整面板）导出为高清 PNG 文件。
@@ -99,17 +123,9 @@ func SavePNGFunc(path string, view func(c *ui.Context), width, height int, scale
 	if path == "" {
 		return fmt.Errorf("mygograph: empty output path")
 	}
-	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
-		}
-	}
-	img := RenderFunc(view, width, height, scale)
-	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
-		return err
-	}
-	return os.WriteFile(path, buf.Bytes(), 0o644)
+	return writeFileAtomic(path, func(w io.Writer) error {
+		return png.Encode(w, RenderFunc(view, width, height, scale))
+	})
 }
 
 // SavePNG 便捷方法：将当前单图以 width × height DIP 和 scale 超采样倍率保存为 PNG。
@@ -217,16 +233,9 @@ func SaveViewportCSV(path string, p *Plot) error {
 	if path == "" {
 		return fmt.Errorf("mygograph: empty csv output path")
 	}
-	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
-		}
-	}
-	var buf bytes.Buffer
-	if err := WriteViewportCSV(&buf, p); err != nil {
-		return err
-	}
-	return os.WriteFile(path, buf.Bytes(), 0o644)
+	return writeFileAtomic(path, func(w io.Writer) error {
+		return WriteViewportCSV(w, p)
+	})
 }
 
 func appendCSVEscaped(dst []byte, s string) []byte {

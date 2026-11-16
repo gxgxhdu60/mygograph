@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/egoist/mygo/ui"
+	"github.com/gaoxi/mygograph/data"
 )
 
 func TestViewBoxAnchorZoomInvarianceAndStack(t *testing.T) {
@@ -15,9 +16,9 @@ func TestViewBoxAnchorZoomInvarianceAndStack(t *testing.T) {
 	}
 
 	const (
-		w, h       float32 = 800, 400
-		anchX      float32 = 240 // 30% 水平处 -> X = 40.0
-		anchY      float32 = 100 // 25% 顶距处 -> Y = 100.0
+		w, h  float32 = 800, 400
+		anchX float32 = 240 // 30% 水平处 -> X = 40.0
+		anchY float32 = 100 // 25% 顶距处 -> Y = 100.0
 	)
 	beforeX, beforeY := vb.LocalToData(anchX, anchY, w, h)
 	vb.ZoomAtAnchor(anchX, anchY, w, h, 0.25, 0.4, AxisBoth)
@@ -83,5 +84,33 @@ func TestViewBoxCycleSafeLinkXAndLimits(t *testing.T) {
 	dx, dy := a.ScreenToData(px, py, rect)
 	if math.Abs(dx-14.25) > 1e-4 || math.Abs(dy-0.35) > 1e-4 {
 		t.Fatalf("ScreenToData inverse mismatch: got (%v,%v)", dx, dy)
+	}
+}
+
+func TestViewBoxAutoBoundsNoBumpWhenUnchanged(t *testing.T) {
+	vb := NewViewBox()
+	xr := data.Range{Min: 0, Max: 10}
+	yr := data.Range{Min: -1, Max: 5}
+
+	vb.ApplyAutoBounds(xr, yr, true, true)
+	revAfterFirst := vb.Revision()
+
+	var calls int
+	vb.AddChangeListener(func(*ViewBox) { calls++ })
+
+	vb.ApplyAutoBounds(xr, yr, true, true)
+	if vb.Revision() != revAfterFirst {
+		t.Fatalf("identical ApplyAutoBounds bumped revision: %d -> %d", revAfterFirst, vb.Revision())
+	}
+	if calls != 0 {
+		t.Fatalf("identical ApplyAutoBounds fired %d change listeners", calls)
+	}
+
+	x0, x1 := vb.XRange()
+	vb.SetXRange(x0, x1, 0)
+	revAfterManual := vb.Revision()
+	vb.SetXRange(x0, x1, 0)
+	if vb.Revision() != revAfterManual {
+		t.Fatalf("repeated SetXRange to current range bumped revision: %d -> %d", revAfterManual, vb.Revision())
 	}
 }

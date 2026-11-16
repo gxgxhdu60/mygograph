@@ -14,7 +14,7 @@ func TestSavePNGRestoresLiveHostState(t *testing.T) {
 	tt := ui.NewTester(func(c *ui.Context) { p.View(c) }, 420, 260)
 	tt.Frame()
 
-	liveSvc := p.services
+	liveSvc := p.servicesValue()
 	liveW, liveH := p.elemW, p.elemH
 	livePlotRect := p.localPlotRect
 	if liveW != 420 || liveH != 260 {
@@ -26,7 +26,7 @@ func TestSavePNGRestoresLiveHostState(t *testing.T) {
 		t.Fatalf("SavePNG: %v", err)
 	}
 
-	if p.services != liveSvc {
+	if p.servicesValue() != liveSvc {
 		t.Fatalf("SavePNG must restore live window Services")
 	}
 	if p.elemW != liveW || p.elemH != liveH || p.localPlotRect != livePlotRect {
@@ -38,11 +38,11 @@ func TestSavePNGRestoresLiveHostState(t *testing.T) {
 	gl.AddRow(p)
 	tt2 := ui.NewTester(func(c *ui.Context) { gl.View(c) }, 500, 300)
 	tt2.Frame()
-	svc2 := p.services
+	svc2 := p.servicesValue()
 	if err := gl.SavePNG(filepath.Join(t.TempDir(), "gl.png"), 800, 500, 1.0); err != nil {
 		t.Fatalf("GraphLayout SavePNG: %v", err)
 	}
-	if p.services != svc2 {
+	if p.servicesValue() != svc2 {
 		t.Fatalf("GraphLayout SavePNG must restore child Plot Services")
 	}
 }

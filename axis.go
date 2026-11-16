@@ -45,6 +45,7 @@ type Axis struct {
 	label          string
 	unit           string
 	scale          Scale
+	linScale       Scale
 	visible        bool
 	showGrid       bool
 	showMinorGrid  bool
@@ -166,6 +167,38 @@ func (a *Axis) SetScale(sc Scale) *Axis {
 	if sc != nil {
 		a.scale = sc
 	}
+	return a
+}
+
+// SetLogMode 切换对数/线性比例尺模式，开启时保存当前比例尺，关闭时原样恢复（避免丢失 TimeScale 等配置）。
+func (a *Axis) SetLogMode(enable bool) *Axis {
+	if enable {
+		if a.scale != nil && a.scale.IsLog() {
+			return a
+		}
+		a.linScale = a.scale
+		useSI := true
+		if ls, ok := a.scale.(*LinearScale); ok {
+			useSI = ls.UseSI
+		}
+		a.scale = &LogScale{UseSI: useSI}
+		return a
+	}
+	if a.scale == nil || !a.scale.IsLog() {
+		return a
+	}
+	if a.linScale != nil {
+		a.scale = a.linScale
+		a.linScale = nil
+		return a
+	}
+	useSI := true
+	if ls, ok := a.scale.(*LogScale); ok {
+		useSI = ls.UseSI
+	}
+	lin := NewLinearScale()
+	lin.UseSI = useSI
+	a.scale = lin
 	return a
 }
 

@@ -149,3 +149,109 @@ func TestMultiRingBufferConcurrentReadWrite(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// 回归：扫描头恰好落在周期边界（newBuckets==0）且 eraseGapSec=0 时，
+// 桶 0 只能包含当前周期样本，上一周期段不得回写覆盖同一桶。
+func TestMultiRingBufferSweepCycleBoundaryNoOverlap(t *testing.T) {
+	const (
+		sr      = 1000.0
+		winSec  = 1.0
+		buckets = 200
+	)
+	mrb := NewMultiRingBufferPerChannel(1, sr, 2000)
+	frame := []float64{100.0}
+	for range 1000 {
+		mrb.PushFrame(frame)
+	}
+	frame[0] = 1.0
+	mrb.PushFrame(frame)
+
+	dst := make([]MinMax, buckets)
+	cursor, valid := mrb.DecimateSweep(0, winSec, 0, buckets, dst)
+	if cursor != 0 {
+		t.Fatalf("cursorNorm = %v, want 0 at exact cycle boundary", cursor)
+	}
+	if valid == 0 {
+		t.Fatal("expected valid buckets")
+	}
+	if !dst[0].Valid || dst[0].Min != 1.0 || dst[0].Max != 1.0 {
+		t.Fatalf("boundary bucket[0] = %+v, want Min=Max=1 (current cycle only)", dst[0])
+	}
+	if !dst[1].Valid || dst[1].Min != 100.0 || dst[1].Max != 100.0 {
+		t.Fatalf("bucket[1] = %+v, want previous cycle Min=Max=100", dst[1])
+	}
+}
+
+// 校验 mid-cycle 下 ScanSweepMinMax / PackShaderEnvelope 与 DecimateSweep 结果一致。
+func TestMultiRingBufferSweepScanPackAgreement(t *testing.T) {
+	const (
+		nCh     = 4
+		sr      = 1000.0
+		winSec  = 2.0
+		buckets = 200
+	)
+	mrb := NewMultiRingBufferPerChannel(nCh, sr, 4000)
+	frame := make([]float64, nCh)
+	for i := range 2500 {
+		for ch := range nCh {
+			frame[ch] = float64(i%97) + float64(ch)
+		}
+		mrb.PushFrame(frame)
+	}
+
+	dst := make([]MinMax, buckets)
+	cursor, _ := mrb.DecimateSweep(0, winSec, 0.2, buckets, dst)
+
+	s0 := make([]int32, buckets)
+	sl := make([]int32, buckets)
+	dMin := make([]float32, buckets)
+	dMax := make([]float32, buckets)
+	dVal := make([]byte, buckets)
+	var scanMin, scanMax []float32
+	var scanVal []byte
+	cursor2 := mrb.ScanSweepMinMax(winSec, 0.2, buckets, s0, sl, dMin, dMax, dVal, func(ch int) {
+		if ch == 0 {
+			scanMin = append([]float32(nil), dMin...)
+			scanMax = append([]float32(nil), dMax...)
+			scanVal = append([]byte(nil), dVal...)
+		}
+	})
+	if cursor != cursor2 {
+		t.Fatalf("cursor mismatch: decimate=%v scan=%v", cursor, cursor2)
+	}
+	for b := range buckets {
+		if dst[b].Valid != (scanVal[b] != 0) {
+			t.Fatalf("bucket %d valid mismatch: decimate=%v scan=%v", b, dst[b].Valid, scanVal[b])
+		}
+		if dst[b].Valid && (dst[b].Min != scanMin[b] || dst[b].Max != scanMax[b]) {
+			t.Fatalf("bucket %d: decimate min/max=%v/%v, scan=%v/%v", b, dst[b].Min, dst[b].Max, scanMin[b], scanMax[b])
+		}
+	}
+
+	pix := make([]byte, 2*nCh*buckets*4)
+	stride := buckets * 4
+	minS := make([]float32, buckets)
+	maxS := make([]float32, buckets)
+	valS := make([]byte, buckets)
+	s0p := make([]int32, buckets)
+	slp := make([]int32, buckets)
+	cursor3 := mrb.PackShaderEnvelope(0, 0, true, winSec, 0.2, buckets, false, 1.0, nil, pix, stride, s0p, slp, minS, maxS, valS)
+	if cursor3 != cursor {
+		t.Fatalf("PackShaderEnvelope cursor = %v, want %v", cursor3, cursor)
+	}
+	for b := range buckets {
+		off := b * 4
+		pMin := pix[off : off+4]
+		empty := pMin[0] == 0 && pMin[1] == 0 && pMin[2] == 0
+		if dst[b].Valid == empty {
+			t.Fatalf("bucket %d pack validity mismatch: pix=%v decimate=%+v", b, pMin, dst[b])
+		}
+		if !dst[b].Valid {
+			continue
+		}
+		q := float64(uint16(pMin[0])<<8|uint16(pMin[1])) - 32768.5
+		if math.Abs(q-float64(dst[b].Min)) > 1.0 {
+			t.Fatalf("bucket %d packed min %v vs decimate %v", b, q, dst[b].Min)
+		}
+	}
+}

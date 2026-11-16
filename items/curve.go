@@ -371,30 +371,69 @@ func (c *CurveItem) drawBaselineFill(p *ui.Painter, pts [][2]float32, baseY floa
 
 func (c *CurveItem) drawFillBetween(p *ui.Painter, upper, lower [][2]float32) {
 	c.fillPath.Reset()
+	li := 0
+	nLower := len(lower)
 	started := false
-	for _, pt := range upper {
-		if isNaN32(pt[0]) || isNaN32(pt[1]) {
+	for i := 0; i < len(upper); {
+		for i < len(upper) && (isNaN32(upper[i][0]) || isNaN32(upper[i][1])) {
+			i++
+		}
+		j := i
+		for j < len(upper) && !isNaN32(upper[j][0]) && !isNaN32(upper[j][1]) {
+			j++
+		}
+		if j-i < 2 {
+			i = j + 1
 			continue
 		}
-		if !started {
-			c.fillPath.MoveTo(pt[0], pt[1])
+		x0, x1 := upper[i][0], upper[j-1][0]
+		lo, hi := min(x0, x1), max(x0, x1)
+		ascending := x1 >= x0
+		for li < nLower {
+			lx := lower[li][0]
+			if isNaN32(lx) || isNaN32(lower[li][1]) || (ascending && lx < lo) || (!ascending && lx > hi) {
+				li++
+				continue
+			}
+			break
+		}
+		kEnd := li
+		for kEnd < nLower {
+			lx := lower[kEnd][0]
+			if isNaN32(lx) || isNaN32(lower[kEnd][1]) || (lx >= lo && lx <= hi) {
+				kEnd++
+				continue
+			}
+			break
+		}
+		hasLower := false
+		for k := kEnd - 1; k >= li; k-- {
+			if !isNaN32(lower[k][0]) && !isNaN32(lower[k][1]) {
+				hasLower = true
+				break
+			}
+		}
+		if hasLower {
+			c.fillPath.MoveTo(upper[i][0], upper[i][1])
+			for k := i + 1; k < j; k++ {
+				c.fillPath.LineTo(upper[k][0], upper[k][1])
+			}
+			for k := kEnd - 1; k >= li; k-- {
+				pt := lower[k]
+				if isNaN32(pt[0]) || isNaN32(pt[1]) {
+					continue
+				}
+				c.fillPath.LineTo(pt[0], pt[1])
+			}
+			c.fillPath.Close()
 			started = true
-		} else {
-			c.fillPath.LineTo(pt[0], pt[1])
 		}
+		li = kEnd
+		i = j
 	}
-	if !started {
-		return
+	if started {
+		p.FillPath(c.fillPath, c.fillColor)
 	}
-	for i := len(lower) - 1; i >= 0; i-- {
-		pt := lower[i]
-		if isNaN32(pt[0]) || isNaN32(pt[1]) {
-			continue
-		}
-		c.fillPath.LineTo(pt[0], pt[1])
-	}
-	c.fillPath.Close()
-	p.FillPath(c.fillPath, c.fillColor)
 }
 
 func expandStepPoints(pts [][2]float32, mode StepMode, out [][2]float32) [][2]float32 {

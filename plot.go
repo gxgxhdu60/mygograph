@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"math"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/egoist/mygo/ui"
@@ -173,7 +174,7 @@ type Plot struct {
 	rightDragged bool
 
 	// VSync 实时流唤醒与空闲自动休眠状态
-	services       ui.Services
+	svc            atomic.Pointer[ui.Services]
 	lastStreamSum  uint64
 	lastStreamMove time.Time
 	extraMenu      func(m *ui.Menu)
@@ -207,6 +208,7 @@ func NewPlot(opts ...PlotOption) *Plot {
 			opt(p)
 		}
 	}
+	p.vb.boundsFn = p.itemBounds
 	// 同步坐标轴对数状态至 ViewBox
 	p.syncScaleFlags()
 	return p
@@ -347,14 +349,15 @@ func (p *Plot) snapshotLiveState() func() {
 		lastStreamMove                    time.Time
 	}
 	st := liveState{
-		p.services, p.lastMods, p.elemW, p.elemH,
+		p.servicesValue(), p.lastMods, p.elemW, p.elemH,
 		p.localPlotRect, p.localLeftAx, p.localRightAx, p.localTopAx, p.localBotAx,
 		p.autoBtnRect, p.liveBtnRect, p.hasAutoBtn, p.hasLiveBtn, p.pointerIn,
 		p.hoverX, p.hoverY, p.hoverCursor, p.lastStreamSum, p.lastStreamMove,
 	}
 	hits := append([]legendHitBox(nil), p.legendHits...)
 	return func() {
-		p.services, p.lastMods, p.elemW, p.elemH = st.services, st.lastMods, st.elemW, st.elemH
+		p.setServices(st.services)
+		p.lastMods, p.elemW, p.elemH = st.lastMods, st.elemW, st.elemH
 		p.localPlotRect, p.localLeftAx, p.localRightAx, p.localTopAx, p.localBotAx = st.plotR, st.leftR, st.rightR, st.topR, st.botR
 		p.autoBtnRect, p.liveBtnRect, p.hasAutoBtn, p.hasLiveBtn, p.pointerIn = st.autoBtnRect, st.liveBtnRect, st.hasAutoBtn, st.hasLiveBtn, st.pointerIn
 		p.hoverX, p.hoverY, p.hoverCursor = st.hoverX, st.hoverY, st.hoverCursor
@@ -372,9 +375,24 @@ func (p *Plot) SetContextMenuHook(fn func(m *ui.Menu)) {
 	p.extraMenu = fn
 }
 
+func (p *Plot) setServices(s ui.Services) {
+	if cur := p.svc.Load(); cur == nil || *cur != s {
+		p.svc.Store(&s)
+	}
+}
+
+func (p *Plot) servicesValue() ui.Services {
+	if s := p.svc.Load(); s != nil {
+		return *s
+	}
+	return ui.Services{}
+}
+
 // Invalidate 线程安全地请求宿主窗口在下一个 VSync 周期重绘（可供后台采集 RingBuffer 唤醒回调直接绑定）。
 func (p *Plot) Invalidate() {
-	p.services.Invalidate()
+	if s := p.svc.Load(); s != nil {
+		s.Invalidate()
+	}
 }
 
 // WakeFunc 返回可直接传给 RingBuffer.SetWakeFunc 的跨协程无阻塞重绘唤醒闭包。
@@ -429,12 +447,9 @@ func (p *Plot) MeasureRightMargin(estHeight float32) float32 {
 
 // View 在声明式 UI 树中挂载并返回可链式布局的 Plot 元素句柄（默认填充父容器可用空间）。
 func (p *Plot) View(c *ui.Context) ui.Element {
-	p.services = c.Services()
+	p.setServices(c.Services())
 	p.lastMods = c.Modifiers()
 	p.syncScaleFlags()
-	if !p.customTheme && c.Theme() != nil {
-		// 未显式指定主题时保留 DarkTheme 科研默认风格
-	}
 
 	el := ui.Box(c).
 		Fill().
@@ -471,31 +486,30 @@ func (p *Plot) currentCursor() ui.Cursor {
 	return ui.CursorCrosshair
 }
 
-func (p *Plot) updateAutoRangeFromItems() {
-	if p.vb.AutoRangeMask() == AxisNone {
-		return
-	}
-	var xUnion, yUnion data.Range
-	hasBounds := false
+func (p *Plot) itemBounds() (xr, yr data.Range, ok bool) {
 	for _, it := range p.items {
 		if it == nil || !it.Visible() {
 			continue
 		}
-		xr, yr, ok := it.Bounds()
-		if !ok {
+		ixr, iyr, iok := it.Bounds()
+		if !iok {
 			continue
 		}
-		if !hasBounds {
-			xUnion, yUnion = xr, yr
-			hasBounds = true
+		if !ok {
+			xr, yr, ok = ixr, iyr, true
 		} else {
-			xUnion = xUnion.Union(xr)
-			yUnion = yUnion.Union(yr)
+			xr = xr.Union(ixr)
+			yr = yr.Union(iyr)
 		}
 	}
-	if hasBounds {
-		p.vb.ApplyAutoBounds(xUnion, yUnion, true, true)
+	return xr, yr, ok
+}
+
+func (p *Plot) updateAutoRangeFromItems() {
+	if p.vb.AutoRangeMask() == AxisNone {
+		return
 	}
+	p.vb.applyLinkedAutoBounds()
 }
 
 func (p *Plot) computeSubRects(totalW, totalH float32) {
@@ -1287,20 +1301,12 @@ func (p *Plot) buildContextMenu(m *ui.Menu) {
 	m.Submenu("Axes & Scale", func(sub *ui.Menu) {
 		if sub.Item("Log X Scale").Checked(p.vb.LogX()).Chosen() {
 			next := !p.vb.LogX()
-			if next {
-				p.bottomAxis.SetScale(NewLogScale())
-			} else {
-				p.bottomAxis.SetScale(NewLinearScale())
-			}
+			p.bottomAxis.SetLogMode(next)
 			p.vb.SetLogX(next)
 		}
 		if sub.Item("Log Y Scale").Checked(p.vb.LogY()).Chosen() {
 			next := !p.vb.LogY()
-			if next {
-				p.leftAxis.SetScale(NewLogScale())
-			} else {
-				p.leftAxis.SetScale(NewLinearScale())
-			}
+			p.leftAxis.SetLogMode(next)
 			p.vb.SetLogY(next)
 		}
 		if sub.Item("Invert Y Axis").Checked(p.vb.InvertY()).Chosen() {
@@ -1333,7 +1339,7 @@ func (p *Plot) buildContextMenu(m *ui.Menu) {
 		csvText := p.buildViewportCSVString()
 		if csvText != "" {
 			p.lastCSVExport = csvText
-			p.services.WriteClipboard(csvText)
+			p.servicesValue().WriteClipboard(csvText)
 		}
 	}
 	if m.Item("Export High-DPI PNG (2x)").Chosen() {
@@ -1356,13 +1362,8 @@ func (p *Plot) buildContextMenu(m *ui.Menu) {
 }
 
 func (p *Plot) buildViewportCSVString() string {
-	if csvExportHook != nil {
-		return csvExportHook(p)
-	}
-	return ""
+	return FormatViewportCSV(p)
 }
-
-var csvExportHook func(p *Plot) string
 
 func offsetRect(r ui.Rect, dx, dy float32) ui.Rect {
 	return ui.Rect{X: r.X + dx, Y: r.Y + dy, W: r.W, H: r.H}

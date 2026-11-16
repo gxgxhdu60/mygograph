@@ -60,3 +60,19 @@ func TestAxisFourOrientationsAndChannelDecimation(t *testing.T) {
 		t.Fatalf("unexpected rendered image bounds: %v", img.Bounds())
 	}
 }
+
+func TestAxisSetLogModePreservesOriginalScale(t *testing.T) {
+	ax := NewAxis(AxisBottom)
+	ts := NewTimeScale()
+	ax.SetScale(ts)
+
+	ax.SetLogMode(true)
+	if !ax.Scale().IsLog() {
+		t.Fatal("SetLogMode(true) should activate log scale")
+	}
+
+	ax.SetLogMode(false)
+	if ax.Scale() != ts {
+		t.Fatalf("SetLogMode(false) should restore the original *TimeScale, got %T", ax.Scale())
+	}
+}

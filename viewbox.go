@@ -87,12 +87,15 @@ type ViewBox struct {
 	linkedY []*ViewBox
 	syncing bool
 
+	boundsFn func() (xr, yr data.Range, ok bool)
+	groupBuf []*ViewBox
+
 	onChange  func()
 	listeners []func(*ViewBox)
 	rev       uint64
 }
 
-// NewViewBox 创建默认视口 [-1, 1] × [-1, 1]、开启双轴自动量程的 ViewBox。
+// NewViewBox 创建默认视口 [0, 1] × [-1, 1]、开启双轴自动量程的 ViewBox。
 func NewViewBox() *ViewBox {
 	return &ViewBox{
 		xMin:        0,
@@ -275,12 +278,8 @@ func (vb *ViewBox) SetRange(minX, maxX, minY, maxY, padding float64) {
 	vb.setYRangeInternal(minY, maxY, padding, true)
 }
 
-func (vb *ViewBox) setXRangeInternal(minX, maxX, padding float64, manual bool) {
-	if !isFinite64(minX) || !isFinite64(maxX) {
-		return
-	}
-	lo, hi := min(minX, maxX), max(minX, maxX)
-	if vb.logX {
+func paddedRange(lo, hi, padding float64, isLog bool) (float64, float64) {
+	if isLog {
 		lo, hi = sanitizePositiveRange(lo, hi)
 		if padding > 0 {
 			lLo, lHi := math.Log10(lo), math.Log10(hi)
@@ -288,24 +287,33 @@ func (vb *ViewBox) setXRangeInternal(minX, maxX, padding float64, manual bool) {
 			if d == 0 {
 				d = 0.5
 			}
-			lo, hi = math.Pow(10, lLo-d), math.Pow(10, lHi+d)
+			return math.Pow(10, lLo-d), math.Pow(10, lHi+d)
 		}
-	} else {
-		span := hi - lo
-		if span == 0 {
-			delta := max(math.Abs(lo)*0.05, 1.0)
-			lo -= delta
-			hi += delta
-		} else if padding > 0 {
-			lo -= span * padding
-			hi += span * padding
-		}
+		return lo, hi
 	}
-	vb.xMin, vb.xMax = lo, hi
-	if manual {
-		vb.autoX = false
+	span := hi - lo
+	if span == 0 {
+		delta := max(math.Abs(lo)*0.05, 1.0)
+		return lo - delta, hi + delta
 	}
-	vb.clampX()
+	if padding > 0 {
+		lo -= span * padding
+		hi += span * padding
+	}
+	return lo, hi
+}
+
+func (vb *ViewBox) setXRangeInternal(minX, maxX, padding float64, manual bool) {
+	if !isFinite64(minX) || !isFinite64(maxX) {
+		return
+	}
+	lo, hi := paddedRange(min(minX, maxX), max(minX, maxX), padding, vb.logX)
+	lo, hi = vb.clampedX(lo, hi)
+	auto := vb.autoX && !manual
+	if lo == vb.xMin && hi == vb.xMax && auto == vb.autoX {
+		return
+	}
+	vb.xMin, vb.xMax, vb.autoX = lo, hi, auto
 	vb.bump()
 	vb.propagateX()
 }
@@ -314,33 +322,13 @@ func (vb *ViewBox) setYRangeInternal(minY, maxY, padding float64, manual bool) {
 	if !isFinite64(minY) || !isFinite64(maxY) {
 		return
 	}
-	lo, hi := min(minY, maxY), max(minY, maxY)
-	if vb.logY {
-		lo, hi = sanitizePositiveRange(lo, hi)
-		if padding > 0 {
-			lLo, lHi := math.Log10(lo), math.Log10(hi)
-			d := (lHi - lLo) * padding
-			if d == 0 {
-				d = 0.5
-			}
-			lo, hi = math.Pow(10, lLo-d), math.Pow(10, lHi+d)
-		}
-	} else {
-		span := hi - lo
-		if span == 0 {
-			delta := max(math.Abs(lo)*0.05, 1.0)
-			lo -= delta
-			hi += delta
-		} else if padding > 0 {
-			lo -= span * padding
-			hi += span * padding
-		}
+	lo, hi := paddedRange(min(minY, maxY), max(minY, maxY), padding, vb.logY)
+	lo, hi = vb.clampedY(lo, hi)
+	auto := vb.autoY && !manual
+	if lo == vb.yMin && hi == vb.yMax && auto == vb.autoY {
+		return
 	}
-	vb.yMin, vb.yMax = lo, hi
-	if manual {
-		vb.autoY = false
-	}
-	vb.clampY()
+	vb.yMin, vb.yMax, vb.autoY = lo, hi, auto
 	vb.bump()
 	vb.propagateY()
 }
@@ -348,20 +336,96 @@ func (vb *ViewBox) setYRangeInternal(minY, maxY, padding float64, manual bool) {
 // ApplyAutoBounds 根据当前所有可见图元的联合包围盒自动更新处于 autoX/autoY 状态的坐标轴。
 func (vb *ViewBox) ApplyAutoBounds(xBounds, yBounds data.Range, hasX, hasY bool) {
 	if vb.autoX && hasX && xBounds.Valid() {
-		prevX0, prevX1 := vb.xMin, vb.xMax
 		// X 轴（如时间轴）默认零留白贴边铺满，除非区间退化为单点
 		xPad := 0.0
 		if xBounds.Span() == 0 {
 			xPad = vb.autoPadding
 		}
 		vb.setXRangeInternal(xBounds.Min, xBounds.Max, xPad, false)
-		if vb.xMin == prevX0 && vb.xMax == prevX1 {
-			// 未发生实际变化
-		}
 	}
 	if vb.autoY && hasY && yBounds.Valid() {
 		vb.setYRangeInternal(yBounds.Min, yBounds.Max, vb.autoPadding, false)
 	}
+}
+
+// applyLinkedAutoBounds 汇总本 ViewBox 及其 X/Y 联动组内全部成员的图元包围盒，
+// 以联动组联合范围驱动自动量程（保证 LinkX/LinkY 下各子图视口一致）。
+func (vb *ViewBox) applyLinkedAutoBounds() {
+	if !vb.autoX && !vb.autoY {
+		return
+	}
+	var selfXr, selfYr data.Range
+	selfOk := false
+	selfCalled := false
+	boundsOf := func(m *ViewBox) (data.Range, data.Range, bool) {
+		if m == vb {
+			if !selfCalled {
+				if vb.boundsFn != nil {
+					selfXr, selfYr, selfOk = vb.boundsFn()
+				}
+				selfCalled = true
+			}
+			return selfXr, selfYr, selfOk
+		}
+		if m.boundsFn == nil {
+			return data.Range{}, data.Range{}, false
+		}
+		return m.boundsFn()
+	}
+
+	var xUnion, yUnion data.Range
+	hasX, hasY := false, false
+	if vb.autoX {
+		vb.collectLinkGroup(true)
+		for _, m := range vb.groupBuf {
+			if xr, _, ok := boundsOf(m); ok {
+				if !hasX {
+					xUnion, hasX = xr, true
+				} else {
+					xUnion = xUnion.Union(xr)
+				}
+			}
+		}
+	}
+	if vb.autoY {
+		vb.collectLinkGroup(false)
+		for _, m := range vb.groupBuf {
+			if _, yr, ok := boundsOf(m); ok {
+				if !hasY {
+					yUnion, hasY = yr, true
+				} else {
+					yUnion = yUnion.Union(yr)
+				}
+			}
+		}
+	}
+	vb.ApplyAutoBounds(xUnion, yUnion, hasX, hasY)
+}
+
+// collectLinkGroup 收集 vb 在 linkedX（xAxis=true）或 linkedY 邻接关系上的传递闭包（含自身）至 vb.groupBuf（稳态零分配复用）。
+func (vb *ViewBox) collectLinkGroup(xAxis bool) {
+	vb.groupBuf = append(vb.groupBuf[:0], vb)
+	for i := 0; i < len(vb.groupBuf); i++ {
+		m := vb.groupBuf[i]
+		peers := m.linkedX
+		if !xAxis {
+			peers = m.linkedY
+		}
+		for _, peer := range peers {
+			if !containsVB(vb.groupBuf, peer) {
+				vb.groupBuf = append(vb.groupBuf, peer)
+			}
+		}
+	}
+}
+
+func containsVB(list []*ViewBox, target *ViewBox) bool {
+	for _, item := range list {
+		if item == target {
+			return true
+		}
+	}
+	return false
 }
 
 // EnforceAspect 在给定绘图区像素宽高下执行纵横比锁定调整（调整 Y 跨度匹配 X 比例）。
@@ -460,17 +524,7 @@ func (vb *ViewBox) PanByPixels(dx, dy, width, height float32, mask AxisMask) {
 		if vb.invertX {
 			frac = -frac
 		}
-		if vb.logX {
-			lo, hi := sanitizePositiveRange(vb.xMin, vb.xMax)
-			lLo, lHi := math.Log10(lo), math.Log10(hi)
-			shift := -frac * (lHi - lLo)
-			vb.xMin = math.Pow(10, lLo+shift)
-			vb.xMax = math.Pow(10, lHi+shift)
-		} else {
-			shift := -frac * (vb.xMax - vb.xMin)
-			vb.xMin += shift
-			vb.xMax += shift
-		}
+		vb.xMin, vb.xMax = panAxis(vb.xMin, vb.xMax, frac, vb.logX)
 		vb.autoX = false
 		vb.clampX()
 		changedX = true
@@ -481,17 +535,7 @@ func (vb *ViewBox) PanByPixels(dx, dy, width, height float32, mask AxisMask) {
 		if !vb.invertY {
 			frac = -frac
 		}
-		if vb.logY {
-			lo, hi := sanitizePositiveRange(vb.yMin, vb.yMax)
-			lLo, lHi := math.Log10(lo), math.Log10(hi)
-			shift := -frac * (lHi - lLo)
-			vb.yMin = math.Pow(10, lLo+shift)
-			vb.yMax = math.Pow(10, lHi+shift)
-		} else {
-			shift := -frac * (vb.yMax - vb.yMin)
-			vb.yMin += shift
-			vb.yMax += shift
-		}
+		vb.yMin, vb.yMax = panAxis(vb.yMin, vb.yMax, frac, vb.logY)
 		vb.autoY = false
 		vb.clampY()
 		changedY = true
@@ -527,20 +571,7 @@ func (vb *ViewBox) ZoomAtAnchor(anchorLX, anchorLY, width, height float32, scale
 		if vb.invertX {
 			nx = 1.0 - nx
 		}
-		if vb.logX {
-			lo, hi := sanitizePositiveRange(vb.xMin, vb.xMax)
-			lLo, lHi := math.Log10(lo), math.Log10(hi)
-			anchor := lLo + nx*(lHi-lLo)
-			newSpan := (lHi - lLo) * scaleX
-			vb.xMin = math.Pow(10, anchor-nx*newSpan)
-			vb.xMax = math.Pow(10, anchor+(1-nx)*newSpan)
-		} else {
-			span := vb.xMax - vb.xMin
-			anchor := vb.xMin + nx*span
-			newSpan := span * scaleX
-			vb.xMin = anchor - nx*newSpan
-			vb.xMax = anchor + (1.0-nx)*newSpan
-		}
+		vb.xMin, vb.xMax = zoomAxis(vb.xMin, vb.xMax, nx, scaleX, vb.logX)
 		vb.autoX = false
 		vb.clampX()
 		changedX = true
@@ -551,20 +582,7 @@ func (vb *ViewBox) ZoomAtAnchor(anchorLX, anchorLY, width, height float32, scale
 		if !vb.invertY {
 			ny = 1.0 - ny
 		}
-		if vb.logY {
-			lo, hi := sanitizePositiveRange(vb.yMin, vb.yMax)
-			lLo, lHi := math.Log10(lo), math.Log10(hi)
-			anchor := lLo + ny*(lHi-lLo)
-			newSpan := (lHi - lLo) * scaleY
-			vb.yMin = math.Pow(10, anchor-ny*newSpan)
-			vb.yMax = math.Pow(10, anchor+(1-ny)*newSpan)
-		} else {
-			span := vb.yMax - vb.yMin
-			anchor := vb.yMin + ny*span
-			newSpan := span * scaleY
-			vb.yMin = anchor - ny*newSpan
-			vb.yMax = anchor + (1.0-ny)*newSpan
-		}
+		vb.yMin, vb.yMax = zoomAxis(vb.yMin, vb.yMax, ny, scaleY, vb.logY)
 		vb.autoY = false
 		vb.clampY()
 		changedY = true
@@ -731,22 +749,54 @@ func (vb *ViewBox) clampRanges() {
 	vb.clampY()
 }
 
-func (vb *ViewBox) clampX() {
-	vb.xMin, vb.xMax = clampAxisRange(
-		vb.xMin, vb.xMax,
+func (vb *ViewBox) clampedX(lo, hi float64) (float64, float64) {
+	return clampAxisRange(
+		lo, hi,
 		vb.limits.XMin, vb.limits.XMax,
 		vb.limits.MinXSpan, vb.limits.MaxXSpan,
 		vb.logX,
 	)
 }
 
-func (vb *ViewBox) clampY() {
-	vb.yMin, vb.yMax = clampAxisRange(
-		vb.yMin, vb.yMax,
+func (vb *ViewBox) clampedY(lo, hi float64) (float64, float64) {
+	return clampAxisRange(
+		lo, hi,
 		vb.limits.YMin, vb.limits.YMax,
 		vb.limits.MinYSpan, vb.limits.MaxYSpan,
 		vb.logY,
 	)
+}
+
+func (vb *ViewBox) clampX() {
+	vb.xMin, vb.xMax = vb.clampedX(vb.xMin, vb.xMax)
+}
+
+func (vb *ViewBox) clampY() {
+	vb.yMin, vb.yMax = vb.clampedY(vb.yMin, vb.yMax)
+}
+
+func panAxis(lo, hi, frac float64, isLog bool) (float64, float64) {
+	if isLog {
+		lo, hi = sanitizePositiveRange(lo, hi)
+		lLo, lHi := math.Log10(lo), math.Log10(hi)
+		shift := -frac * (lHi - lLo)
+		return math.Pow(10, lLo+shift), math.Pow(10, lHi+shift)
+	}
+	shift := -frac * (hi - lo)
+	return lo + shift, hi + shift
+}
+
+func zoomAxis(lo, hi, n, scale float64, isLog bool) (float64, float64) {
+	if isLog {
+		lo, hi = sanitizePositiveRange(lo, hi)
+		lLo, lHi := math.Log10(lo), math.Log10(hi)
+		anchor := lLo + n*(lHi-lLo)
+		newSpan := (lHi - lLo) * scale
+		return math.Pow(10, anchor-n*newSpan), math.Pow(10, anchor+(1-n)*newSpan)
+	}
+	anchor := lo + n*(hi-lo)
+	newSpan := (hi - lo) * scale
+	return anchor - n*newSpan, anchor + (1.0-n)*newSpan
 }
 
 func clampAxisRange(lo, hi, hardMin, hardMax, minSpan, maxSpan float64, isLog bool) (float64, float64) {
